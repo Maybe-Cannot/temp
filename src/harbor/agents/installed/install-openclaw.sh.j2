@@ -18,8 +18,16 @@ npm -v
 git clone -b openclaw https://github.com/Maybe-Cannot/temp.git
 cd temp
 
-npm install
-npm link
+npm install -g pnpm
+
+
+pnpm install
+pnpm ui:build
+pnpm build
+
+mkdir -p src/canvas-host/a2ui/
+echo "console.log('A2UI stub');" > src/canvas-host/a2ui/a2ui.bundle.js
+
 
 # Install mcporter — used by openclaw's memory/QMD subsystem.
 # NOTE: mcporter does NOT provide general MCP tool-server integration;

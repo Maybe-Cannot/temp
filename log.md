@@ -94,13 +94,16 @@ nvm install 22
 # 显示 npm 版本
 npm -v
 
+npm install -g pnpm
+
 # 安装 openclaw（如指定 version 则安装对应版本，否则安装最新版）
 git clone -b openclaw https://github.com/Maybe-Cannot/temp.git
 cd temp
 
-npm install
-npm
-
+pnpm install
+pnpm ui:build # 首次运行会自动安装 UI 依赖
+pnpm build
+pnpm link --global
 # 安装 mcporter（openclaw 的 memory/QMD 子系统依赖）
 # 注意：mcporter 并不提供通用的 MCP 工具服务器集成，openclaw 的 ACP 转换器当前会忽略外部 MCP 服务器。
 npm i -g mcporter
