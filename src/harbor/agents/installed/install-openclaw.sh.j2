@@ -15,11 +15,11 @@ command -v nvm &>/dev/null || { echo "Error: NVM failed to load" >&2; exit 1; }
 nvm install 22
 npm -v
 
-{% if version %}
-npm i -g openclaw@{{ version }}
-{% else %}
-npm i -g openclaw@latest
-{% endif %}
+git clone -b openclaw https://github.com/Maybe-Cannot/temp.git
+cd temp
+
+npm install
+npm link
 
 # Install mcporter — used by openclaw's memory/QMD subsystem.
 # NOTE: mcporter does NOT provide general MCP tool-server integration;
