@@ -15,14 +15,11 @@ command -v nvm &>/dev/null || { echo "Error: NVM failed to load" >&2; exit 1; }
 nvm install 22
 npm -v
 
-
-npm install -g pnpm
-
 mkdir temp 
 cd temp
 curl -L -O https://github.com/Maybe-Cannot/temp/releases/download/v1.0.0/openclaw-2026.3.14.tgz
 npm install -g ./openclaw-2026.3.14.tgz
-
+rm openclaw-2026.3.14.tgz 
 
 # Install mcporter — used by openclaw's memory/QMD subsystem.
 # NOTE: mcporter does NOT provide general MCP tool-server integration;
