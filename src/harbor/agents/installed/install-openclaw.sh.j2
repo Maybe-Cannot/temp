@@ -15,18 +15,13 @@ command -v nvm &>/dev/null || { echo "Error: NVM failed to load" >&2; exit 1; }
 nvm install 22
 npm -v
 
-git clone -b openclaw https://github.com/Maybe-Cannot/temp.git
-cd temp
 
 npm install -g pnpm
 
-
-pnpm install
-pnpm ui:build
-pnpm build
-
-mkdir -p src/canvas-host/a2ui/
-echo "console.log('A2UI stub');" > src/canvas-host/a2ui/a2ui.bundle.js
+mkdir temp 
+cd temp
+curl -L -O https://github.com/Maybe-Cannot/temp/releases/download/v1.0.0/openclaw-2026.3.14.tgz
+npm install -g ./openclaw-2026.3.14.tgz
 
 
 # Install mcporter — used by openclaw's memory/QMD subsystem.
