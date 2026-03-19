@@ -53,15 +53,11 @@ class CliBackendSpec:
     args: list[str]
     resume_args: list[str]
     output_mode: str
-    resume_output_mode: str
     input_mode: str
     max_prompt_arg_chars: int
     session_mode: str
     session_arg: str
     session_args: list[str]
-    session_id_fields: list[str]
-    system_prompt_arg: str
-    system_prompt_when: str
     extra_env: dict[str, str]
     clear_env: list[str]
 
@@ -101,12 +97,6 @@ class CliBackendSpec:
         if output_mode not in {"json", "jsonl", "text"}:
             output_mode = "json"
 
-        resume_output_mode = (
-            env.get("OPENCLAW_RESUME_OUTPUT_MODE") or output_mode
-        ).strip().lower()
-        if resume_output_mode not in {"json", "jsonl", "text"}:
-            resume_output_mode = output_mode
-
         input_mode = (env.get("OPENCLAW_INPUT_MODE") or "arg").strip().lower()
         if input_mode not in {"arg", "stdin"}:
             input_mode = "arg"
@@ -114,12 +104,6 @@ class CliBackendSpec:
         session_mode = (env.get("OPENCLAW_SESSION_MODE") or "always").strip().lower()
         if session_mode not in {"always", "existing", "none"}:
             session_mode = "always"
-
-        system_prompt_when = (
-            env.get("OPENCLAW_SYSTEM_PROMPT_WHEN") or "first"
-        ).strip().lower()
-        if system_prompt_when not in {"first", "always", "never"}:
-            system_prompt_when = "first"
 
         max_prompt = 6000
         try:
@@ -132,20 +116,11 @@ class CliBackendSpec:
             args=_json_list("OPENCLAW_CLI_ARGS_JSON", ["agent", "--json"]),
             resume_args=_json_list("OPENCLAW_CLI_RESUME_ARGS_JSON", []),
             output_mode=output_mode,
-            resume_output_mode=resume_output_mode,
             input_mode=input_mode,
             max_prompt_arg_chars=max(100, max_prompt),
             session_mode=session_mode,
             session_arg=(env.get("OPENCLAW_SESSION_ARG") or "--session-id").strip(),
             session_args=_json_list("OPENCLAW_SESSION_ARGS_JSON", []),
-            session_id_fields=_csv(
-                "OPENCLAW_SESSION_ID_FIELDS",
-                ["session_id", "sessionId", "conversation_id", "conversationId", "thread_id"],
-            ),
-            system_prompt_arg=(
-                env.get("OPENCLAW_SYSTEM_PROMPT_ARG") or "--append-system-prompt"
-            ).strip(),
-            system_prompt_when=system_prompt_when,
             extra_env=_json_obj("OPENCLAW_BACKEND_ENV_JSON"),
             clear_env=_csv("OPENCLAW_BACKEND_CLEAR_ENV", []),
         )
@@ -226,7 +201,7 @@ class Openclaw(BaseInstalledAgent):
                     )
                 api_key_env = f"{provider.upper()}_API_KEY"
 
-        return {
+        config: dict[str, Any] = {
             "models": {
                 "providers": {
                     provider: {
@@ -266,22 +241,23 @@ class Openclaw(BaseInstalledAgent):
                     }
                 ]
             },
-            # Root fix for plugin runtime warnings in Harbor containers:
-            # disable plugin system by default, unless explicitly re-enabled.
-            # If needed, set OPENCLAW_PLUGINS_ENABLED=1 and optionally
-            # OPENCLAW_MEMORY_PLUGIN_SLOT=memory-core.
-            "plugins": {
-                "enabled": plugins_enabled,
-                "deny": ["openshell", "memory-core"] if not plugins_enabled else [],
-                "entries": {
-                    "openshell": {"enabled": False},
-                    "memory-core": {"enabled": False},
-                },
-                "slots": {
-                    "memory": memory_slot,
-                }
-            },
         }
+
+        # Do not emit a plugins block unless explicitly requested.
+        # In current OpenClaw versions, an explicit plugins section triggers
+        # plugin-registry discovery/validation, which can fail in constrained
+        # runtime images before `agent` starts.
+        explicit_plugins_enabled = "OPENCLAW_PLUGINS_ENABLED" in env
+        explicit_memory_slot = "OPENCLAW_MEMORY_PLUGIN_SLOT" in env
+        if explicit_plugins_enabled or explicit_memory_slot:
+            plugins_config: dict[str, Any] = {
+                "enabled": plugins_enabled,
+            }
+            if memory_slot != "none":
+                plugins_config["slots"] = {"memory": memory_slot}
+            config["plugins"] = plugins_config
+
+        return config
 
     def _resolve_agent_id(self) -> str:
         env = self._runtime_env()
@@ -347,24 +323,15 @@ class Openclaw(BaseInstalledAgent):
                 commands.append(ExecInput(command=skills_cmd, env=env, timeout_sec=30))
 
             escaped_instruction = shlex.quote(instruction)
+            base_command = (
+                ". ~/.nvm/nvm.sh 2>/dev/null || true; "
+                "openclaw agent --local --json "
+                f"--agent {shlex.quote(self._resolve_agent_id())} "
+                f"--message {escaped_instruction}"
+            )
             commands.append(
                 ExecInput(
-                    command=(
-                        "set -o pipefail; "
-                        ". ~/.nvm/nvm.sh 2>/dev/null || true; "
-                        "openclaw agent --local --json "
-                        f"--agent {shlex.quote(self._resolve_agent_id())} "
-                        f"--message {escaped_instruction} "
-                        "2>/tmp/openclaw-stderr.raw "
-                        "| tee /logs/agent/openclaw.txt; "
-                        "rc=${PIPESTATUS[0]}; "
-                        "grep -Evi 'plugin id mismatch|Unable to resolve plugin runtime module' "
-                        "/tmp/openclaw-stderr.raw > /logs/agent/openclaw-stderr.txt || true; "
-                        f"latest_session=\"$(ls -1t {_STATE_DIR}/agents/*/sessions/*.jsonl 2>/dev/null | head -n1 || true)\"; "
-                        f"[ -n \"$latest_session\" ] && cp \"$latest_session\" /logs/agent/{_COPIED_TRANSCRIPT_FILENAME} || true; "
-                        "chmod -R a+rX /logs/agent/ 2>/dev/null || true"
-                        "; exit $rc"
-                    ),
+                    command=self._wrap_agent_exec_command(base_command),
                     env=env,
                 )
             )
@@ -384,23 +351,32 @@ class Openclaw(BaseInstalledAgent):
         merged_env = {**env, **cmd_env}
         commands.append(
             ExecInput(
-                command=(
-                    "set -o pipefail; "
-                    f"{cmd} "
-                    "2>/tmp/openclaw-stderr.raw "
-                    "| tee /logs/agent/openclaw.txt; "
-                    "rc=${PIPESTATUS[0]}; "
-                    "grep -Evi 'plugin id mismatch|Unable to resolve plugin runtime module' "
-                    "/tmp/openclaw-stderr.raw > /logs/agent/openclaw-stderr.txt || true; "
-                    f"latest_session=\"$(ls -1t {_STATE_DIR}/agents/*/sessions/*.jsonl 2>/dev/null | head -n1 || true)\"; "
-                    f"[ -n \"$latest_session\" ] && cp \"$latest_session\" /logs/agent/{_COPIED_TRANSCRIPT_FILENAME} || true; "
-                    "chmod -R a+rX /logs/agent/ 2>/dev/null || true"
-                    "; exit $rc"
-                ),
+                command=self._wrap_agent_exec_command(cmd),
                 env=merged_env,
             )
         )
         return commands
+
+    def _wrap_agent_exec_command(self, base_command: str) -> str:
+        # Shared wrapper for both legacy and cli-backend execution paths:
+        # - preserve agent exit code through pipeline
+        # - persist stderr and normalized logs
+        # - copy latest session transcript for ATIF parsing
+        return (
+            "set -o pipefail; "
+            f"{base_command} "
+            "2>/tmp/openclaw-stderr.raw "
+            "| tee /logs/agent/openclaw.txt; "
+            "rc=${PIPESTATUS[0]}; "
+            "grep -Evi 'plugin id mismatch|Unable to resolve plugin runtime module' "
+            "/tmp/openclaw-stderr.raw > /logs/agent/openclaw-stderr.txt || true; "
+            "mkdir -p /logs/agent/openclaw-state 2>/dev/null || true; "
+            f"cp -a {_STATE_DIR}/agents /logs/agent/openclaw-state/ 2>/dev/null || true; "
+            f"latest_session=\"$(ls -1t {_STATE_DIR}/agents/*/sessions/*.jsonl {_STATE_DIR}/agents/*/sessions/*.jsonl.reset.* 2>/dev/null | head -n1 || true)\"; "
+            f"[ -n \"$latest_session\" ] && cp \"$latest_session\" /logs/agent/{_COPIED_TRANSCRIPT_FILENAME} || true; "
+            "chmod -R a+rX /logs/agent/ 2>/dev/null || true"
+            "; exit $rc"
+        )
 
     def _build_cli_backend_command(
         self, instruction: str, backend: CliBackendSpec
@@ -1086,41 +1062,68 @@ class Openclaw(BaseInstalledAgent):
     def _find_transcript_path(self, session_id: str) -> Path | None:
         copied = self.logs_dir / _COPIED_TRANSCRIPT_FILENAME
         if copied.exists() and copied.is_file():
-            return copied
+            try:
+                if copied.stat().st_size > 0:
+                    return copied
+            except OSError:
+                pass
 
         session_dirs = self._resolve_session_dirs()
         if not session_dirs:
             return None
 
-        if session_id:
+        def newest_matching(patterns: tuple[str, ...]) -> Path | None:
+            # Prefer the freshest file because OpenClaw may keep reset/topic
+            # variants side-by-side in the same session directory.
+            latest_path: Path | None = None
+            latest_mtime = -1.0
             for sessions in session_dirs:
-                candidate = sessions / f"{session_id}.jsonl"
-                if candidate.exists():
-                    return candidate
+                for pattern in patterns:
+                    for candidate in sessions.glob(pattern):
+                        if not candidate.is_file():
+                            continue
+                        try:
+                            stat = candidate.stat()
+                        except OSError:
+                            continue
+                        if stat.st_mtime > latest_mtime:
+                            latest_mtime = stat.st_mtime
+                            latest_path = candidate
+            return latest_path
 
-        latest_path: Path | None = None
-        latest_mtime = -1.0
-        for sessions in session_dirs:
-            for candidate in sessions.glob("*.jsonl"):
-                try:
-                    mtime = candidate.stat().st_mtime
-                except OSError:
-                    continue
-                if mtime > latest_mtime:
-                    latest_mtime = mtime
-                    latest_path = candidate
-        return latest_path
+        if session_id:
+            # OpenClaw may persist topic-scoped transcripts as
+            # <sessionId>-topic-<encodedTopic>.jsonl, and reset archives as
+            # *.jsonl.reset.*. Support both naming styles.
+            matched = newest_matching(
+                (
+                    f"{session_id}.jsonl",
+                    f"{session_id}-topic-*.jsonl",
+                    f"{session_id}.jsonl.reset.*",
+                    f"{session_id}-topic-*.jsonl.reset.*",
+                )
+            )
+            if matched is not None:
+                return matched
+
+        return newest_matching(("*.jsonl", "*.jsonl.reset.*"))
 
     def _parse_transcript_to_trajectory(
         self, session_id: str, default_model_name: str
     ) -> Trajectory | None:
         transcript_path = self._find_transcript_path(session_id)
         if transcript_path is None:
-            print("openclaw-v2: no transcript found")
+            self._append_job_log("openclaw: transcript not found; skip ATIF trajectory parse")
             return None
 
         raw_lines: list[dict[str, Any]] = []
-        for line in transcript_path.read_text(encoding="utf-8").splitlines():
+        try:
+            transcript_lines = transcript_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self._append_job_log(f"openclaw: failed to read transcript: {exc}")
+            return None
+
+        for line in transcript_lines:
             stripped = line.strip()
             if not stripped:
                 continue
