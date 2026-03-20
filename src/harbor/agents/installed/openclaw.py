@@ -70,6 +70,7 @@ _SKILLS_DIR = f"{_WORKSPACE_DIR}/skills"
 _MCPORTER_CONFIG = "/root/.mcporter/mcporter.json"
 _COPIED_TRANSCRIPT_FILENAME = "openclaw-session.jsonl"
 _PLUGIN_INSPECT_FILENAME = "openclaw-plugins.json"
+_PLUGIN_INSPECT_FILENAME = "openclaw-plugins.json"
 
 _OPENAI_COMPAT_BASE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1",
@@ -82,6 +83,13 @@ _OPENAI_COMPAT_BASE_URLS: dict[str, str] = {
 
 @dataclass
 class CliBackendSpec:
+    """CLI 后端规格。
+
+    输入：环境变量解析结果。
+    输出：规范化后的命令参数/模式/环境配置。
+    作用：避免在命令拼接阶段直接散落读取环境变量，集中约束默认值与容错行为。
+    """
+
     """CLI 后端规格。
 
     输入：环境变量解析结果。
@@ -103,6 +111,13 @@ class CliBackendSpec:
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "CliBackendSpec":
+        """从环境变量构建 CLI 后端规格。
+
+        输入：`env`（通常为 `os.environ` 与外部注入变量的合并结果）。
+        输出：`CliBackendSpec` 实例。
+        作用：完成字符串/JSON/CSV 类型参数归一化，并提供合法值兜底。
+        """
+
         """从环境变量构建 CLI 后端规格。
 
         输入：`env`（通常为 `os.environ` 与外部注入变量的合并结果）。
@@ -175,6 +190,7 @@ class CliBackendSpec:
 
 class Openclaw(BaseInstalledAgent):
     """OpenClaw 适配器实现（同时支持 legacy 与 cli-backend 两种运行模式）。"""
+    """OpenClaw 适配器实现（同时支持 legacy 与 cli-backend 两种运行模式）。"""
 
     SUPPORTS_ATIF: bool = True
     _OUTPUT_FILENAME = "openclaw.txt"
@@ -202,6 +218,10 @@ class Openclaw(BaseInstalledAgent):
         # 输入：OPENCLAW_BACKEND_MODE（来自运行时环境）
         # 输出：legacy / cli-backend
         # 作用：在未识别值时回退 legacy，保证兼容默认链路。
+        # 模块：运行模式解析
+        # 输入：OPENCLAW_BACKEND_MODE（来自运行时环境）
+        # 输出：legacy / cli-backend
+        # 作用：在未识别值时回退 legacy，保证兼容默认链路。
         mode = (self._extra_env.get("OPENCLAW_BACKEND_MODE") or os.environ.get("OPENCLAW_BACKEND_MODE") or "legacy").strip().lower()
         if mode not in {"legacy", "cli-backend"}:
             return "legacy"
@@ -211,6 +231,13 @@ class Openclaw(BaseInstalledAgent):
         return {**os.environ, **self._extra_env}
 
     def _build_openclaw_config(self) -> dict[str, Any]:
+        """构建 OpenClaw 配置对象。
+
+        输入：`self.model_name` 与运行时环境变量。
+        输出：可序列化的 OpenClaw 配置字典。
+        作用：统一 provider/model 解析、API 鉴权来源、agent 默认配置及插件开关。
+        """
+
         """构建 OpenClaw 配置对象。
 
         输入：`self.model_name` 与运行时环境变量。
@@ -304,6 +331,9 @@ class Openclaw(BaseInstalledAgent):
         # 仅在显式要求时才输出 plugins 配置。
         # 某些 OpenClaw 版本会在检测到 plugins 配置后主动触发插件发现/校验，
         # 在受限运行镜像中可能在 agent 启动前失败，因此默认不写入该段。
+        # 仅在显式要求时才输出 plugins 配置。
+        # 某些 OpenClaw 版本会在检测到 plugins 配置后主动触发插件发现/校验，
+        # 在受限运行镜像中可能在 agent 启动前失败，因此默认不写入该段。
         explicit_plugins_enabled = "OPENCLAW_PLUGINS_ENABLED" in env
         explicit_memory_slot = "OPENCLAW_MEMORY_PLUGIN_SLOT" in env
         if explicit_plugins_enabled or explicit_memory_slot:
@@ -340,6 +370,13 @@ class Openclaw(BaseInstalledAgent):
         return key, env.get(key, "")
 
     def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
+        """构建 Harbor 执行阶段所需命令序列。
+
+        输入：`instruction`（用户任务指令）。
+        输出：按顺序执行的 `ExecInput` 列表。
+        作用：根据运行模式拼装主命令，并注入统一的日志采集和 transcript 拷贝后处理。
+        """
+
         """构建 Harbor 执行阶段所需命令序列。
 
         输入：`instruction`（用户任务指令）。
@@ -390,6 +427,10 @@ class Openclaw(BaseInstalledAgent):
             if plugin_inspect_cmd:
                 commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
 
+            plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
+            if plugin_inspect_cmd:
+                commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
+
             escaped_instruction = shlex.quote(instruction)
             base_command = (
                 ". ~/.nvm/nvm.sh 2>/dev/null || true; "
@@ -419,6 +460,10 @@ class Openclaw(BaseInstalledAgent):
         if plugin_inspect_cmd:
             commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
 
+        plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
+        if plugin_inspect_cmd:
+            commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
+
         cmd, cmd_env = self._build_cli_backend_command(instruction, backend)
         merged_env = {**env, **cmd_env}
         commands.append(
@@ -430,6 +475,16 @@ class Openclaw(BaseInstalledAgent):
         return commands
 
     def _wrap_agent_exec_command(self, base_command: str) -> str:
+        """统一包装执行命令。
+
+        输入：`base_command`（不带日志重定向与收尾处理的 OpenClaw 主命令）。
+        输出：可直接交给 shell 执行的完整命令字符串。
+        作用：
+        1) 保留管道前主进程退出码；
+        2) 统一落盘 stdout/stderr；
+        3) 复制最新 transcript，供后续 ATIF 转换使用。
+        """
+
         """统一包装执行命令。
 
         输入：`base_command`（不带日志重定向与收尾处理的 OpenClaw 主命令）。
@@ -459,6 +514,13 @@ class Openclaw(BaseInstalledAgent):
     def _build_cli_backend_command(
         self, instruction: str, backend: CliBackendSpec
     ) -> tuple[str, dict[str, str]]:
+        """构建 cli-backend 模式下的基础命令。
+
+        输入：`instruction` 与 `backend` 规格。
+        输出：`(command, extra_env)`。
+        作用：处理会话恢复参数、stdin/argv 输入模式，以及环境变量清理前缀。
+        """
+
         """构建 cli-backend 模式下的基础命令。
 
         输入：`instruction` 与 `backend` 规格。
@@ -532,10 +594,36 @@ class Openclaw(BaseInstalledAgent):
             "2>/logs/agent/openclaw-plugins-stderr.txt || true"
         )
 
+    def _build_capture_plugin_inventory_command(self) -> str | None:
+        """构建插件清单采集命令。
+
+        输入：运行时环境变量（可通过 OPENCLAW_CAPTURE_PLUGIN_INSPECT 控制开关）。
+        输出：shell 命令字符串（关闭时返回 None）。
+        作用：将插件 inspect 结果写入日志目录，供后处理阶段做“工具名→插件”映射。
+        """
+
+        enabled_raw = (self._runtime_env().get("OPENCLAW_CAPTURE_PLUGIN_INSPECT") or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no", "off"}:
+            return None
+
+        return (
+            ". ~/.nvm/nvm.sh 2>/dev/null || true; "
+            "openclaw plugins inspect --all --json "
+            f"> /logs/agent/{_PLUGIN_INSPECT_FILENAME} "
+            "2>/logs/agent/openclaw-plugins-stderr.txt || true"
+        )
+
     def _state_session_file(self) -> Path:
         return self.logs_dir / "openclaw-last-session-id.txt"
 
     def populate_context_post_run(self, context: AgentContext) -> None:
+        """运行后回填 Harbor 上下文并生成兼容产物。
+
+        输入：`AgentContext`（待填充对象）与运行日志目录中的输出文件。
+        输出：更新后的 `context`、可选 `trajectory.json`、episode/debug 产物与结构化日志。
+        作用：聚合输出解析、令牌统计、轨迹转换、日志写入与临时产物清理。
+        """
+
         """运行后回填 Harbor 上下文并生成兼容产物。
 
         输入：`AgentContext`（待填充对象）与运行日志目录中的输出文件。
@@ -596,6 +684,7 @@ class Openclaw(BaseInstalledAgent):
                 )
 
         # 尽力输出与官方框架形态对齐的兼容产物。
+        # 尽力输出与官方框架形态对齐的兼容产物。
         self._emit_official_like_artifacts(parsed=parsed, trajectory=trajectory)
         self._append_structured_logs(
             parsed=parsed,
@@ -610,6 +699,10 @@ class Openclaw(BaseInstalledAgent):
         # 输入：原始输出文本 + 输出模式
         # 输出：统一结构字典（text/usage/sessionId/model 等）
         # 作用：屏蔽 json/jsonl/text 差异，保证后续处理分支稳定。
+        # 模块：后端输出分发解析
+        # 输入：原始输出文本 + 输出模式
+        # 输出：统一结构字典（text/usage/sessionId/model 等）
+        # 作用：屏蔽 json/jsonl/text 差异，保证后续处理分支稳定。
         if not raw:
             return {"text": "", "usage": {}, "sessionId": None}
 
@@ -620,6 +713,10 @@ class Openclaw(BaseInstalledAgent):
         return self._parse_json_output(raw)
 
     def _parse_json_output(self, raw: str) -> dict[str, Any]:
+        # 模块：JSON 输出解析
+        # 输入：可能掺杂日志前后缀的原始文本
+        # 输出：统一字段字典；解析失败时退化为纯文本结果
+        # 作用：尽量从非严格输出中恢复有效 JSON，减少运行波动对主流程影响。
         # 模块：JSON 输出解析
         # 输入：可能掺杂日志前后缀的原始文本
         # 输出：统一字段字典；解析失败时退化为纯文本结果
@@ -674,9 +771,14 @@ class Openclaw(BaseInstalledAgent):
         if isinstance(text, str) and text.strip():
             return text.strip()
         # 当未返回完整 system prompt 文本时，保留紧凑 report 便于排查。
+        # 当未返回完整 system prompt 文本时，保留紧凑 report 便于排查。
         return json.dumps(report, ensure_ascii=False)
 
     def _parse_jsonl_output(self, raw: str) -> dict[str, Any]:
+        # 模块：JSONL 输出解析
+        # 输入：逐行 JSON 事件文本
+        # 输出：聚合后的 text/usage/sessionId/model
+        # 作用：面向流式输出场景，逐行容错并累加 usage。
         # 模块：JSONL 输出解析
         # 输入：逐行 JSON 事件文本
         # 输出：聚合后的 text/usage/sessionId/model
@@ -749,6 +851,10 @@ class Openclaw(BaseInstalledAgent):
         # 输入：单条解析后的响应对象
         # 输出：session id（若不存在则返回 None）
         # 作用：兼容多种字段命名与嵌套结构，降低后端协议差异影响。
+        # 模块：会话 ID 提取
+        # 输入：单条解析后的响应对象
+        # 输出：session id（若不存在则返回 None）
+        # 作用：兼容多种字段命名与嵌套结构，降低后端协议差异影响。
         fields_raw = (
             self._runtime_env().get("OPENCLAW_SESSION_ID_FIELDS")
             or "session_id,sessionId,conversation_id,conversationId,thread_id"
@@ -777,6 +883,13 @@ class Openclaw(BaseInstalledAgent):
         return None
 
     def _extract_model_name(self, parsed: dict[str, Any]) -> str | None:
+        # 模块：模型名提取
+        # 输入：单条解析后的响应对象
+        # 输出：模型名字符串或 None
+        # 作用：按优先级在顶层/session/meta 中提取模型名。
+        value = parsed.get("model")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
         # 模块：模型名提取
         # 输入：单条解析后的响应对象
         # 输出：模型名字符串或 None
@@ -1035,11 +1148,217 @@ class Openclaw(BaseInstalledAgent):
 
         return "\n".join(lines).strip()
 
+    def _load_plugin_tool_index(self) -> dict[str, list[dict[str, str]]]:
+        """加载工具名到插件信息的映射索引。
+
+        输入：`openclaw-plugins.json`（由 `openclaw plugins inspect --all --json` 生成）。
+        输出：`{tool_name_lower: [plugin_info, ...]}`。
+        作用：将插件加载/注册信息并入工具调用记录，提升实验可解释性。
+        """
+
+        plugin_path = self.logs_dir / _PLUGIN_INSPECT_FILENAME
+        if not plugin_path.exists() or not plugin_path.is_file():
+            return {}
+
+        try:
+            raw = plugin_path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+
+        entries: list[dict[str, Any]] = []
+        if isinstance(parsed, list):
+            entries = [entry for entry in parsed if isinstance(entry, dict)]
+        elif isinstance(parsed, dict):
+            plugins = parsed.get("plugins")
+            if isinstance(plugins, list):
+                entries = [entry for entry in plugins if isinstance(entry, dict)]
+
+        index: dict[str, list[dict[str, str]]] = {}
+
+        def register_tool(tool_name: str, plugin_info: dict[str, str]) -> None:
+            normalized = tool_name.strip().lower()
+            if not normalized:
+                return
+            bucket = index.setdefault(normalized, [])
+            plugin_id = plugin_info.get("plugin_id", "")
+            if plugin_id and any(existing.get("plugin_id") == plugin_id for existing in bucket):
+                return
+            bucket.append(plugin_info)
+
+        for entry in entries:
+            plugin = entry.get("plugin") if isinstance(entry.get("plugin"), dict) else entry
+            plugin_id = str(plugin.get("id") or "").strip() if isinstance(plugin, dict) else ""
+            if not plugin_id:
+                continue
+
+            plugin_info = {
+                "plugin_id": plugin_id,
+                "plugin_name": str(plugin.get("name") or plugin_id).strip(),
+                "origin": str(plugin.get("origin") or "").strip(),
+                "source": str(plugin.get("source") or "").strip(),
+            }
+
+            inspect_tools = entry.get("tools")
+            if isinstance(inspect_tools, list):
+                for tool in inspect_tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    names = tool.get("names")
+                    if not isinstance(names, list):
+                        continue
+                    for name in names:
+                        if isinstance(name, str):
+                            register_tool(name, plugin_info)
+
+            tool_names = entry.get("toolNames")
+            if isinstance(tool_names, list):
+                for name in tool_names:
+                    if isinstance(name, str):
+                        register_tool(name, plugin_info)
+
+        return index
+
+    def _lookup_plugin_candidates(
+        self,
+        tool_name: str,
+        plugin_tool_index: dict[str, list[dict[str, str]]],
+    ) -> list[dict[str, str]]:
+        normalized = (tool_name or "").strip().lower()
+        if not normalized:
+            return []
+
+        direct = plugin_tool_index.get(normalized)
+        if direct:
+            return [dict(item) for item in direct]
+
+        # 兼容带命名空间的工具名（如 plugin/tool）。
+        suffix = normalized.split("/", 1)[-1]
+        if suffix and suffix != normalized:
+            matched = plugin_tool_index.get(suffix)
+            if matched:
+                return [dict(item) for item in matched]
+
+        namespace_matches: list[dict[str, str]] = []
+        for candidate_name, items in plugin_tool_index.items():
+            if candidate_name.endswith(f"/{normalized}"):
+                namespace_matches.extend(dict(item) for item in items)
+
+        dedup: dict[str, dict[str, str]] = {}
+        for item in namespace_matches:
+            key = item.get("plugin_id") or json.dumps(item, ensure_ascii=False)
+            dedup[key] = item
+        return list(dedup.values())
+
+    def _build_tool_call_records(
+        self,
+        tool_calls: list[ToolCall] | None,
+        plugin_tool_index: dict[str, list[dict[str, str]]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for call in tool_calls or []:
+            name = call.function_name or ""
+            records.append(
+                {
+                    "id": call.tool_call_id,
+                    "name": name,
+                    "arguments": call.arguments,
+                    "plugin_candidates": self._lookup_plugin_candidates(name, plugin_tool_index),
+                }
+            )
+        return records
+
+    def _build_tool_result_records(
+        self,
+        observation: Observation | None,
+        tool_call_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        call_name_by_id: dict[str, str] = {}
+        for record in tool_call_records:
+            call_id = record.get("id")
+            call_name = record.get("name")
+            if isinstance(call_id, str) and call_id and isinstance(call_name, str):
+                call_name_by_id[call_id] = call_name
+
+        out: list[dict[str, Any]] = []
+        for result in (observation.results if observation and observation.results else []):
+            source_call_id = result.source_call_id if isinstance(result.source_call_id, str) else None
+            out.append(
+                {
+                    "source_call_id": source_call_id,
+                    "tool_name": call_name_by_id.get(source_call_id or "") if source_call_id else None,
+                    "content": result.content,
+                }
+            )
+        return out
+
+    def _render_tool_details_text(
+        self,
+        tool_call_records: list[dict[str, Any]],
+        tool_result_records: list[dict[str, Any]],
+    ) -> str:
+        lines: list[str] = []
+
+        if tool_call_records:
+            lines.append("【工具调用详情】")
+            for idx, call in enumerate(tool_call_records, start=1):
+                name = str(call.get("name") or "") or "(unknown)"
+                call_id = str(call.get("id") or "") or "-"
+                lines.append(f"{idx}. name={name} call_id={call_id}")
+                lines.append(
+                    f"   arguments={json.dumps(call.get('arguments', {}), ensure_ascii=False)}"
+                )
+
+                candidates = call.get("plugin_candidates")
+                if isinstance(candidates, list) and candidates:
+                    rendered = []
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        plugin_id = str(item.get("plugin_id") or "").strip()
+                        plugin_name = str(item.get("plugin_name") or plugin_id).strip()
+                        origin = str(item.get("origin") or "").strip()
+                        source = str(item.get("source") or "").strip()
+                        base = plugin_name if plugin_name else plugin_id
+                        extras = [part for part in [plugin_id, origin, source] if part]
+                        rendered.append(f"{base} ({', '.join(extras)})" if extras else base)
+                    if rendered:
+                        lines.append(f"   plugin_candidates={'; '.join(rendered)}")
+
+        if tool_result_records:
+            if lines:
+                lines.append("")
+            lines.append("【工具调用结果】")
+            for idx, result in enumerate(tool_result_records, start=1):
+                call_id = str(result.get("source_call_id") or "") or "-"
+                tool_name = str(result.get("tool_name") or "") or "(unknown)"
+                content = result.get("content")
+                content_text = "" if content is None else str(content)
+                lines.append(f"{idx}. tool={tool_name} source_call_id={call_id}")
+                lines.append(f"   content={content_text}")
+
+        return "\n".join(lines).strip()
+
     def _emit_official_like_artifacts(
         self,
         parsed: dict[str, Any],
         trajectory: Trajectory | None,
     ) -> None:
+        # 模块：官方风格产物输出
+        # 输入：解析结果与轨迹对象
+        # 输出：episode-*/prompt.txt、response.txt、debug.json
+        # 作用：提供与 Harbor 既有可视化/分析链路对齐的结果目录结构。
+        try:
+            plugin_tool_index = self._load_plugin_tool_index()
+            episodes = self._build_episode_pairs(
+                parsed=parsed,
+                trajectory=trajectory,
+                plugin_tool_index=plugin_tool_index,
+            )
         # 模块：官方风格产物输出
         # 输入：解析结果与轨迹对象
         # 输出：episode-*/prompt.txt、response.txt、debug.json
@@ -1060,6 +1379,10 @@ class Openclaw(BaseInstalledAgent):
                     json.dumps(episode.get("raw", {}), ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
+                (ep_dir / "raw.json").write_text(
+                    json.dumps(episode.get("raw", {}), ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
                 (ep_dir / "debug.json").write_text(
                     json.dumps(episode.get("debug", {}), ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
@@ -1072,11 +1395,14 @@ class Openclaw(BaseInstalledAgent):
         parsed: dict[str, Any],
         trajectory: Trajectory | None,
         plugin_tool_index: dict[str, list[dict[str, str]]] | None = None,
+        plugin_tool_index: dict[str, list[dict[str, str]]] | None = None,
     ) -> list[dict[str, Any]]:
         episodes: list[dict[str, Any]] = []
         tool_index = plugin_tool_index or {}
+        tool_index = plugin_tool_index or {}
 
         if trajectory is not None:
+            # 让 episode 数量与轨迹 step 数量对齐，便于对照调试。
             # 让 episode 数量与轨迹 step 数量对齐，便于对照调试。
             last_prompt = ""
             system_prompt = (
@@ -1092,6 +1418,13 @@ class Openclaw(BaseInstalledAgent):
                         {
                             "prompt": prompt,
                             "response": "",
+                            "raw": {
+                                "prompt_raw": prompt,
+                                "response_raw": "",
+                                "source": step.source,
+                                "step_id": step.step_id,
+                                "timestamp": step.timestamp,
+                            },
                             "raw": {
                                 "prompt_raw": prompt,
                                 "response_raw": "",
@@ -1127,6 +1460,20 @@ class Openclaw(BaseInstalledAgent):
                             else tool_details_text
                         )
 
+                    tool_call_records = self._build_tool_call_records(step.tool_calls, tool_index)
+                    tool_result_records = self._build_tool_result_records(step.observation, tool_call_records)
+                    tool_details_text = self._render_tool_details_text(
+                        tool_call_records,
+                        tool_result_records,
+                    )
+                    response_text = step.message or ""
+                    if tool_details_text:
+                        response_text = (
+                            f"{response_text}\n\n{tool_details_text}"
+                            if response_text
+                            else tool_details_text
+                        )
+
                     debug_obj = {
                         "episode": episode_index,
                         "source": "trajectory-agent-step",
@@ -1147,10 +1494,31 @@ class Openclaw(BaseInstalledAgent):
                         debug_obj["tool_calls"] = tool_call_records
                     if tool_result_records:
                         debug_obj["tool_results"] = tool_result_records
+                    if tool_call_records:
+                        debug_obj["tool_calls"] = tool_call_records
+                    if tool_result_records:
+                        debug_obj["tool_results"] = tool_result_records
 
                     episodes.append(
                         {
                             "prompt": prompt,
+                            "response": response_text,
+                            "raw": {
+                                "prompt_raw": prompt,
+                                "response_raw": step.message or "",
+                                "response_with_tool_details": response_text,
+                                "model": step.model_name,
+                                "step_id": step.step_id,
+                                "timestamp": step.timestamp,
+                                "tool_calls": tool_call_records,
+                                "tool_results": tool_result_records,
+                                "token_usage": {
+                                    "prompt_tokens": step.metrics.prompt_tokens if step.metrics else None,
+                                    "completion_tokens": step.metrics.completion_tokens if step.metrics else None,
+                                    "cached_tokens": step.metrics.cached_tokens if step.metrics else None,
+                                    "cost_usd": step.metrics.cost_usd if step.metrics else None,
+                                },
+                            },
                             "response": response_text,
                             "raw": {
                                 "prompt_raw": prompt,
@@ -1185,6 +1553,13 @@ class Openclaw(BaseInstalledAgent):
                             "step_id": step.step_id,
                             "timestamp": step.timestamp,
                         },
+                        "raw": {
+                            "prompt_raw": last_prompt or system_prompt or "",
+                            "response_raw": step.message or "",
+                            "source": step.source,
+                            "step_id": step.step_id,
+                            "timestamp": step.timestamp,
+                        },
                         "debug": {
                             "episode": episode_index,
                             "source": f"trajectory-{step.source}-step",
@@ -1212,6 +1587,12 @@ class Openclaw(BaseInstalledAgent):
                                 "source": "payloads",
                                 "index": idx,
                             },
+                            "raw": {
+                                "prompt_raw": "",
+                                "response_raw": text,
+                                "source": "payloads",
+                                "index": idx,
+                            },
                             "debug": {
                                 "source": "payloads",
                                 "index": idx,
@@ -1224,6 +1605,11 @@ class Openclaw(BaseInstalledAgent):
                 {
                     "prompt": "",
                     "response": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
+                    "raw": {
+                        "prompt_raw": "",
+                        "response_raw": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
+                        "source": "fallback",
+                    },
                     "raw": {
                         "prompt_raw": "",
                         "response_raw": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
@@ -1260,12 +1646,17 @@ class Openclaw(BaseInstalledAgent):
         # 输入：解析结果、轨迹、上下文计数与输出模式
         # 输出：job.log/trial.log 的摘要与逐轮日志
         # 作用：把关键诊断信息收敛到统一日志，便于问题回放与对比。
+        # 模块：结构化日志汇总
+        # 输入：解析结果、轨迹、上下文计数与输出模式
+        # 输出：job.log/trial.log 的摘要与逐轮日志
+        # 作用：把关键诊断信息收敛到统一日志，便于问题回放与对比。
         usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
         payloads = parsed.get("payloads") if isinstance(parsed.get("payloads"), list) else []
         text = parsed.get("text") if isinstance(parsed.get("text"), str) else ""
         session_id = parsed.get("sessionId") if isinstance(parsed.get("sessionId"), str) else ""
         model = parsed.get("model") if isinstance(parsed.get("model"), str) else (self.model_name or "")
         step_count = len(trajectory.steps) if trajectory is not None else 0
+        plugin_tool_index = self._load_plugin_tool_index()
         plugin_tool_index = self._load_plugin_tool_index()
 
         stderr_path = self.logs_dir / "openclaw-stderr.txt"
@@ -1286,6 +1677,7 @@ class Openclaw(BaseInstalledAgent):
         self._append_job_log(
             f"openclaw: payloads={len(payloads)} text_chars={len(text)} trajectory_steps={step_count}"
         )
+        self._append_job_log(f"openclaw: plugin_tool_index_size={len(plugin_tool_index)}")
         self._append_job_log(f"openclaw: plugin_tool_index_size={len(plugin_tool_index)}")
         system_prompt = parsed.get("systemPrompt") if isinstance(parsed.get("systemPrompt"), str) else ""
         if system_prompt:
@@ -1316,9 +1708,11 @@ class Openclaw(BaseInstalledAgent):
                 )
                 if step.tool_calls:
                     tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
+                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
                     self._append_job_log(
                         "openclaw: turn[{}] tool_calls={}".format(
                             turn,
+                            json.dumps(tool_call_records, ensure_ascii=False),
                             json.dumps(tool_call_records, ensure_ascii=False),
                         )
                     )
@@ -1328,9 +1722,15 @@ class Openclaw(BaseInstalledAgent):
                         step.observation,
                         tool_call_records,
                     )
+                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
+                    tool_result_records = self._build_tool_result_records(
+                        step.observation,
+                        tool_call_records,
+                    )
                     self._append_job_log(
                         "openclaw: turn[{}] tool_results={}".format(
                             turn,
+                            json.dumps(tool_result_records, ensure_ascii=False),
                             json.dumps(tool_result_records, ensure_ascii=False),
                         )
                     )
@@ -1342,6 +1742,11 @@ class Openclaw(BaseInstalledAgent):
         self._append_job_log("openclaw: run summary end")
 
     def _cleanup_agent_artifacts(self) -> None:
+        # 模块：运行后清理
+        # 输入：logs 目录中的临时执行产物
+        # 输出：删除不需要暴露给上层的中间文件/目录
+        # 作用：保持输出目录稳定、简洁，并与官方结果布局保持一致。
+        # 为保持与官方布局一致，清理不对上层暴露的低层执行中间产物。
         # 模块：运行后清理
         # 输入：logs 目录中的临时执行产物
         # 输出：删除不需要暴露给上层的中间文件/目录
@@ -1359,6 +1764,7 @@ class Openclaw(BaseInstalledAgent):
             except OSError:
                 pass
 
+        # 不保留 terminus 专用产物，避免污染 openclaw 适配器输出。
         # 不保留 terminus 专用产物，避免污染 openclaw 适配器输出。
         for name in ("recording.cast", "terminus_2.pane"):
             artifact = self.logs_dir / name
@@ -1381,6 +1787,10 @@ class Openclaw(BaseInstalledAgent):
                 pass
 
     def _build_register_mcp_servers_command(self, mode: str) -> str | None:
+        # 模块：MCP 服务注册命令构建
+        # 输入：`mode` 与 `self.mcp_servers`
+        # 输出：shell 命令字符串（无 MCP 时返回 None）
+        # 作用：生成 OpenClaw/兼容后端可读取的 MCP 配置文件。
         # 模块：MCP 服务注册命令构建
         # 输入：`mode` 与 `self.mcp_servers`
         # 输出：shell 命令字符串（无 MCP 时返回 None）
@@ -1412,6 +1822,8 @@ class Openclaw(BaseInstalledAgent):
 
         # 在 cli-backend 模式仍写入 mcporter 配置保持兼容，
         # 同时额外写一份后端可直接读取的 MCP 配置。
+        # 在 cli-backend 模式仍写入 mcporter 配置保持兼容，
+        # 同时额外写一份后端可直接读取的 MCP 配置。
         backend_mcp_config = shlex.quote(json.dumps({"mcpServers": servers}, indent=2))
         return (
             f"mkdir -p /root/.mcporter {_STATE_DIR} && "
@@ -1420,6 +1832,10 @@ class Openclaw(BaseInstalledAgent):
         )
 
     def _build_register_skills_command(self) -> str | None:
+        # 模块：Skills 同步命令构建
+        # 输入：`self.skills_dir`
+        # 输出：复制 skills 的 shell 命令（无目录时返回 None）
+        # 作用：将 Harbor 提供的技能目录同步到容器内固定位置。
         # 模块：Skills 同步命令构建
         # 输入：`self.skills_dir`
         # 输出：复制 skills 的 shell 命令（无目录时返回 None）
@@ -1433,6 +1849,10 @@ class Openclaw(BaseInstalledAgent):
         )
 
     def _resolve_session_dirs(self) -> list[Path]:
+        # 模块：Session 目录发现
+        # 输入：`logs_dir/openclaw-state/agents`
+        # 输出：可用 sessions 目录列表
+        # 作用：为 transcript 定位提供候选路径集合。
         # 模块：Session 目录发现
         # 输入：`logs_dir/openclaw-state/agents`
         # 输出：可用 sessions 目录列表
@@ -1460,6 +1880,16 @@ class Openclaw(BaseInstalledAgent):
         3) 在多个匹配文件中选择最新修改时间的文件。
         """
 
+        """定位 transcript 文件路径。
+
+        输入：`session_id`（可为空，空时退化为“取最新 transcript”策略）。
+        输出：可读 transcript 文件路径或 `None`。
+        作用：
+        1) 优先使用已复制到 logs 目录的 transcript；
+        2) 其次在 sessions 目录按 session/topic/reset 命名匹配；
+        3) 在多个匹配文件中选择最新修改时间的文件。
+        """
+
         copied = self.logs_dir / _COPIED_TRANSCRIPT_FILENAME
         if copied.exists() and copied.is_file():
             try:
@@ -1473,6 +1903,7 @@ class Openclaw(BaseInstalledAgent):
             return None
 
         def newest_matching(patterns: tuple[str, ...]) -> Path | None:
+            # 优先取最新文件；OpenClaw 可能在同目录并存 reset/topic 变体。
             # 优先取最新文件；OpenClaw 可能在同目录并存 reset/topic 变体。
             latest_path: Path | None = None
             latest_mtime = -1.0
@@ -1491,6 +1922,9 @@ class Openclaw(BaseInstalledAgent):
             return latest_path
 
         if session_id:
+            # OpenClaw 可能将 transcript 按 topic 存为
+            # <sessionId>-topic-<encodedTopic>.jsonl，重置归档则是 *.jsonl.reset.*。
+            # 这里同时兼容两类命名。
             # OpenClaw 可能将 transcript 按 topic 存为
             # <sessionId>-topic-<encodedTopic>.jsonl，重置归档则是 *.jsonl.reset.*。
             # 这里同时兼容两类命名。
@@ -1543,9 +1977,55 @@ class Openclaw(BaseInstalledAgent):
         normalized = str(content).strip()
         return normalized or None
 
+    def _extract_tool_result_text(self, content: Any) -> str | None:
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+                        continue
+                    parts.append(json.dumps(item, ensure_ascii=False))
+                    continue
+                if item is None:
+                    continue
+                item_text = str(item).strip()
+                if item_text:
+                    parts.append(item_text)
+            merged = "\n".join(part for part in parts if part).strip()
+            return merged or None
+
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            rendered = json.dumps(content, ensure_ascii=False).strip()
+            return rendered or None
+
+        if isinstance(content, str):
+            normalized = content.strip()
+            return normalized or None
+
+        if content is None:
+            return None
+
+        normalized = str(content).strip()
+        return normalized or None
+
     def _parse_transcript_to_trajectory(
         self, session_id: str, default_model_name: str
     ) -> Trajectory | None:
+        """将 OpenClaw transcript 转换为 Harbor ATIF 轨迹。
+
+        输入：`session_id` 与默认模型名。
+        输出：`Trajectory` 或 `None`。
+        作用：
+        1) 解析 user/assistant/system 事件；
+        2) 提取 tool_use/tool_result 并做关联合并；
+        3) 汇总 token metrics，生成标准 ATIF 结构。
+        """
+
         """将 OpenClaw transcript 转换为 Harbor ATIF 轨迹。
 
         输入：`session_id` 与默认模型名。
@@ -1590,6 +2070,9 @@ class Openclaw(BaseInstalledAgent):
             if not isinstance(message, dict):
                 continue
 
+            role_raw = message.get("role")
+            role = str(role_raw).strip().lower() if role_raw is not None else ""
+            if role not in ("user", "assistant", "system", "toolresult"):
             role_raw = message.get("role")
             role = str(role_raw).strip().lower() if role_raw is not None else ""
             if role not in ("user", "assistant", "system", "toolresult"):
@@ -1667,6 +2150,46 @@ class Openclaw(BaseInstalledAgent):
                 )
                 continue
 
+            if role == "toolresult":
+                call_id_raw = (
+                    message.get("toolCallId")
+                    or message.get("toolUseId")
+                    or message.get("tool_call_id")
+                    or message.get("tool_use_id")
+                    or event.get("toolCallId")
+                    or event.get("toolUseId")
+                    or event.get("tool_call_id")
+                    or event.get("tool_use_id")
+                )
+                call_id = str(call_id_raw or "").strip()
+
+                tool_name = str(message.get("toolName") or message.get("tool_name") or "").strip()
+                result_text = self._extract_tool_result_text(content)
+                if tool_name and result_text:
+                    result_text = f"[tool={tool_name}]\n{result_text}"
+
+                if call_id or result_text:
+                    turn_tool_results.append(
+                        ObservationResult(
+                            source_call_id=call_id or None,
+                            content=result_text,
+                        )
+                    )
+
+                proto_turns.append(
+                    {
+                        "role": role,
+                        "timestamp": timestamp,
+                        "model": model_from_event,
+                        "text_parts": text_parts,
+                        "tool_calls": turn_tool_calls,
+                        "tool_results": turn_tool_results,
+                        "merged_results": [],
+                        "metrics": metrics,
+                    }
+                )
+                continue
+
             for block in blocks:
                 btype = str(block.get("type") or "").lower()
 
@@ -1682,6 +2205,11 @@ class Openclaw(BaseInstalledAgent):
                         arguments = block.get("arguments")
                     if arguments is None:
                         arguments = {}
+                    arguments = block.get("input")
+                    if arguments is None:
+                        arguments = block.get("arguments")
+                    if arguments is None:
+                        arguments = {}
                     if not isinstance(arguments, dict):
                         arguments = {"input": arguments}
                     turn_tool_calls.append(
@@ -1692,6 +2220,14 @@ class Openclaw(BaseInstalledAgent):
                         )
                     )
                 elif btype in ("tool_result", "tool_result_error"):
+                    call_id = str(
+                        block.get("tool_use_id")
+                        or block.get("toolUseId")
+                        or block.get("tool_call_id")
+                        or block.get("toolCallId")
+                        or ""
+                    )
+                    result_text = self._extract_tool_result_text(block.get("content"))
                     call_id = str(
                         block.get("tool_use_id")
                         or block.get("toolUseId")
@@ -1742,6 +2278,7 @@ class Openclaw(BaseInstalledAgent):
             if not text and tool_calls is None and observation is None and turn["metrics"] is None:
                 continue
 
+            source = "agent" if turn["role"] not in ("user", "system") else turn["role"]
             source = "agent" if turn["role"] not in ("user", "system") else turn["role"]
             steps.append(
                 Step(
