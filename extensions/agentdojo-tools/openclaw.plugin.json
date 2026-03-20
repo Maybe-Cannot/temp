@@ -1,0 +1,45 @@
+{
+  "id": "agentdojo-tools",
+  "name": "AgentDojo Tools",
+  "description": "Register AgentDojo tools from a generated catalog and execute via Python runner.",
+  "enabledByDefault": true,
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "catalogPath": {
+        "type": "string",
+        "default": "./openclaw_tool_catalog.json"
+      },
+      "runnerPath": {
+        "type": "string"
+      },
+      "pythonBin": {
+        "type": "string",
+        "default": "python"
+      },
+      "configPath": {
+        "type": "string"
+      },
+      "statePath": {
+        "type": "string"
+      },
+      "callLogPath": {
+        "type": "string"
+      },
+      "toolNamePrefix": {
+        "type": "string",
+        "default": "agentdojo_"
+      },
+      "registerOptionalTools": {
+        "type": "boolean",
+        "default": false
+      },
+      "timeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "default": 120000
+      }
+    }
+  }
+}

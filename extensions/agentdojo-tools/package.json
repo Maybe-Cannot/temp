@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw/agentdojo-tools",
+  "version": "2026.3.14",
+  "private": true,
+  "description": "AgentDojo tool catalog bridge for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
