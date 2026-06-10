@@ -98,7 +98,7 @@ harbor run -d terminal-bench-sample -a oracle
 ### 4.3 运行标准任务
 
 ```bash
-harbor run -d hello-world -m deepseek/deepseek-chat -a terminus-2
+harbor run -d hello-world -m deepseek/deepseek-v4-pro -a terminus-2
 ```
 
 ### 4.4 从本地数据集启动任务

@@ -985,6 +985,10 @@ def start(
         console.print("[red]Error:[/red] --share-org / --share-user requires --upload.")
         raise SystemExit(1)
 
+    _cwd_env = Path(".env")
+    if env_file is None and _cwd_env.exists():
+        load_dotenv(_cwd_env, override=False)
+
     if env_file is not None:
         if not env_file.exists():
             console.print(f"[red]❌ Env file not found: {env_file}[/red]")
@@ -1345,6 +1349,10 @@ def start(
     if env_file is not None:
         explicit_env_file_keys = {
             key for key in dotenv_values(env_file).keys() if key is not None
+        }
+    elif _cwd_env.exists():
+        explicit_env_file_keys = {
+            key for key in dotenv_values(_cwd_env).keys() if key is not None
         }
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
