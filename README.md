@@ -22,26 +22,41 @@ pip install git+https://github.com/Maybe-Cannot/temp.git@harbor
 
 ## 02 配置 API 密钥
 
-所有密钥通过环境变量注入，多个 provider 可同时配置，互不冲突。切换模型时**只需修改 `--model` 参数**，无需重置变量。
+在任意位置创建 `.env` 文件，填入需要的 provider，其余保持注释：
+
+```
+# Anthropic
+# ANTHROPIC_API_KEY=sk-ant-...
+# ANTHROPIC_BASE_URL=https://api.anthropic.com
+
+# OpenAI
+# OPENAI_API_KEY=sk-...
+# OPENAI_BASE_URL=https://api.openai.com/v1
+
+# DeepSeek
+# DEEPSEEK_API_KEY=sk-...
+# DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+
+# Qwen（阿里云百炼 / DashScope）
+# DASHSCOPE_API_KEY=sk-...
+# DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# Kimi（月之暗面）
+# MOONSHOT_API_KEY=sk-...
+# MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+
+# GLM（智谱 AI）
+# ZAI_API_KEY=...
+# ZAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+```
+
+运行时通过 `--env-file` 传入：
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-
-export OPENAI_API_KEY="sk-..."
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-
-export DEEPSEEK_API_KEY="sk-..."
-export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
-
-export DASHSCOPE_API_KEY="sk-..."        # Qwen
-export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-export MOONSHOT_API_KEY="sk-..."         # Kimi
-export MOONSHOT_BASE_URL="https://api.moonshot.cn/v1"
-
-export ZAI_API_KEY="..."                 # GLM
-export ZAI_BASE_URL="https://open.bigmodel.cn/api/paas/v4/"
+harbor run ... --env-file /path/to/.env
 ```
+
+多个 provider 可同时写入，切换模型时**只改 `--model`**，`.env` 不动。
 
 可使用的模型及格式请参考 [LiteLLM 定价文档](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)。
 
@@ -89,7 +104,7 @@ harbor run -d hello-world -m deepseek/deepseek-chat -a terminus-2
 ### 4.4 从本地数据集启动任务
 
 ```bash
-harbor run -p <path> -m deepseek/deepseek-chat -a terminus-2
+harbor run -p <path> -m deepseek/deepseek-chat -a terminus-2 --env-file /path/to/.env
 ```
 
 路径下每个子目录代表一个测试任务，根目录需包含 `task.toml`。
@@ -99,36 +114,32 @@ harbor run -p <path> -m deepseek/deepseek-chat -a terminus-2
 openclaw v2026.5.5 已接入并注册，支持上述所有 provider：
 
 ```bash
-harbor run -d hello-world -m deepseek/deepseek-chat -a openclaw
-harbor run -d hello-world -m dashscope/qwen-plus -a openclaw
-harbor run -d hello-world -m anthropic/claude-opus-4-8 -a openclaw
+harbor run -p <path> -m deepseek/deepseek-chat -a openclaw --env-file /path/to/.env
+harbor run -p <path> -m dashscope/qwen-plus -a openclaw --env-file /path/to/.env
+harbor run -p <path> -m anthropic/claude-opus-4-8 -a openclaw --env-file /path/to/.env
 ```
-
-> 使用非 Anthropic 模型时建议加 `--skip-api-preflight`。
 
 ## 05 SkillSafetyBench 实验
 
+数据集已展平至 `ssb-dataset/`（155 个 case，每个子目录含 `task.toml`）。
+
 ```bash
-cd skill-safety-bench
+# 运行全部数据集
+harbor run \
+  -p D:/code/skill/skill-safety-bench/ssb-dataset \
+  -m deepseek/deepseek-chat \
+  -a openclaw \
+  --env-file D:/code/skill/skill-safety-bench/.env
 
-# 运行单个 risk domain
-bash scripts/start_agent_batch.sh \
-  --rd 1 --agent openclaw \
-  --model deepseek/deepseek-chat \
-  --skip-api-preflight
-
-# 调试单个 case
-bash scripts/start_agent_batch.sh \
-  --rd 1 \
-  --case offer_letter_routing_cue_precleared_merge_sheet \
-  --agent openclaw --model dashscope/qwen-plus \
-  --skip-api-preflight
-
-# 干跑
-bash scripts/start_agent_batch.sh --rd 1 --agent openclaw --dry-run
+# 运行单个 task（调试）
+harbor run \
+  -p D:/code/skill/skill-safety-bench/ssb-dataset/ssb_rd1_c1_01 \
+  -m deepseek/deepseek-chat \
+  -a openclaw \
+  --env-file D:/code/skill/skill-safety-bench/.env
 ```
 
-结果在 `jobs/.../attack_results.json`，关注 `attack_success_count`（越少越好）。
+结果在 `jobs/` 目录下，关注 `attack_results.json` 中的 `attack_success_count`（越少越好）。
 
 ## 示例：运行 Terminal-Bench-2.0
 
@@ -151,6 +162,4 @@ harbor run --dataset terminal-bench@2.0 \
    --n-concurrent 100 \
    --env daytona
 ```
-
-
 
