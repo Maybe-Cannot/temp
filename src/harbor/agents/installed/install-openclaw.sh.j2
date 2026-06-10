@@ -1,29 +1,50 @@
 #!/bin/bash
+# install-openclaw.sh.j2
+# Harbor openclaw 安装模板（v2026.5.5）
+# 该文件记录安装流程，供参考；实际安装逻辑内联在 openclaw.py 的 install() 方法中。
+#
+# 渲染变量（jinja2）：
+#   {{ version }}   - openclaw 版本，默认 2026.5.5
+#   {{ tgz_url }}   - GitHub Releases tgz URL
+#   {{ npm_spec }}  - npm 包规格，例如 openclaw@2026.5.5
+
 set -euo pipefail
 
+OPENCLAW_VERSION="{{ version | default('2026.5.5') }}"
+OPENCLAW_TGZ_URL="{{ tgz_url | default('https://github.com/openclaw/openclaw/releases/download/v2026.5.5/openclaw-2026.5.5.tgz') }}"
+OPENCLAW_NPM_SPEC="{{ npm_spec | default('openclaw@2026.5.5') }}"
+
+# 1. 系统依赖
 apt-get update
-apt-get install -y curl git
+apt-get install -y --no-install-recommends curl ca-certificates git
 
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
+# 2. 安装 nvm + Node 22
+retry_all=$(curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' && echo '--retry-all-errors' || true)
+curl -fsSL --retry 5 --retry-delay 2 $retry_all \
+  https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
 
-export NVM_DIR="$HOME/.nvm"
-# Source nvm with || true to handle nvm.sh's internal non-zero returns
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# shellcheck source=/dev/null
 \. "$NVM_DIR/nvm.sh" || true
-# Verify NVM loaded successfully
-command -v nvm &>/dev/null || { echo "Error: NVM failed to load" >&2; exit 1; }
-
 nvm install 22
+node -v
 npm -v
 
-mkdir temp 
-cd temp
-curl -L -O https://github.com/Maybe-Cannot/temp/releases/download/v1.0.2/openclaw-2026.3.14.tgz
-npm install -g ./openclaw-2026.3.14.tgz
-rm openclaw-2026.3.14.tgz 
+# 3. 安装 openclaw：优先 GitHub Releases tgz，回退 npm
+if curl -fsSL --head "$OPENCLAW_TGZ_URL" 2>/dev/null \
+    | grep -qi 'HTTP/[^ ]* 20[0-9]\|HTTP/[^ ]* 30[0-9]'; then
+  curl -fsSL -o /tmp/openclaw.tgz "$OPENCLAW_TGZ_URL"
+  npm install -g /tmp/openclaw.tgz
+  rm -f /tmp/openclaw.tgz
+else
+  npm install -g "$OPENCLAW_NPM_SPEC" \
+    --fetch-retries=5 \
+    --fetch-retry-mintimeout=20000 \
+    --fetch-retry-maxtimeout=120000
+fi
 
-# Install mcporter — used by openclaw's memory/QMD subsystem.
-# NOTE: mcporter does NOT provide general MCP tool-server integration;
-# openclaw's ACP translator currently ignores external MCP servers.
+# 4. 安装 mcporter（openclaw 内存/QMD 子系统依赖）
 npm i -g mcporter
 
+# 5. 验证
 openclaw --version

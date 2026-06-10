@@ -1,4 +1,3 @@
-
 # Harbor 项目更改
 
 Harbor 是由 [Terminal-Bench](https://www.tbench.ai/) 的开发团队推出的一个用于评估和优化智能体（Agent）与大语言模型（LLM）的框架。
@@ -11,126 +10,147 @@ Harbor 是由 [Terminal-Bench](https://www.tbench.ai/) 的开发团队推出的�
 
 ## 01 安装
 
-建议使用`conda + python3.13`
+建议使用 `conda + python3.12`（harbor 要求 Python >= 3.12）
 
-使用以下指令来完成包的安装
+使用以下指令完成包的安装：
 
 ```bash
 pip install git+https://github.com/Maybe-Cannot/temp.git@harbor
 ```
 
-## 02 临时配置
+> **注**：安装需要 `pyproject.toml` 与 `src/` 同时存在于仓库根目录，仅上传 `src/` 无法构建。
 
-需要引入密钥环境变量，目前仅测试过qwen和deepseek
+## 02 配置 API 密钥
 
-可使用的模型及格式请参考[Litellm定价文档](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
-
-导入格式：
+所有密钥通过环境变量注入，多个 provider 可同时配置，互不冲突。切换模型时**只需修改 `--model` 参数**，无需重置变量。
 
 ```bash
-export DASHSCOPE_API_KEY="****"
-export DEEPSEEK_API_KEY="****"
-export ANTHROPIC_API_KEY="****"
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+
+export DEEPSEEK_API_KEY="sk-..."
+export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+
+export DASHSCOPE_API_KEY="sk-..."        # Qwen
+export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+export MOONSHOT_API_KEY="sk-..."         # Kimi
+export MOONSHOT_BASE_URL="https://api.moonshot.cn/v1"
+
+export ZAI_API_KEY="..."                 # GLM
+export ZAI_BASE_URL="https://open.bigmodel.cn/api/paas/v4/"
 ```
 
-## 03 启动一个任务
+可使用的模型及格式请参考 [LiteLLM 定价文档](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)。
 
-要查看所有支持的智能体及其它选项，请运行：
+> **注**：DeepSeek / Qwen / Kimi / GLM 暂无 LiteLLM 计价条目，不影响实验结果。
+
+## 03 支持的模型格式
+
+`--model` 参数统一使用 `provider/model` 格式：
+
+| provider 前缀 | 示例                                                   |
+| ------------- | ------------------------------------------------------ |
+| `anthropic/`  | `anthropic/claude-opus-4-8`                            |
+| `openai/`     | `openai/gpt-4o`                                        |
+| `deepseek/`   | `deepseek/deepseek-chat`                               |
+| `dashscope/`  | `dashscope/qwen-plus`、`dashscope/qwen-max`            |
+| `moonshot/`   | `moonshot/moonshot-v1-8k`、`moonshot/moonshot-v1-128k` |
+| `zai/`        | `zai/glm-4-flash`、`zai/glm-4-air`                     |
+| `nvidia/`     | `nvidia/llama-3.1-nemotron-70b-instruct`               |
+
+## 04 启动一个任务
 
 ```bash
 harbor run --help
 ```
 
-### 3.1 数据集下载
-
-探索所有支持的第三方基准（如 SWE-Bench、Aider Polyglot），可以通过以下命令查看harbor内已注册数据集
+### 4.1 数据集下载
 
 ```bash
 harbor datasets list
-```
-
-随后可以通过download方法对指定数据集下载
-
-```bash
 harbor datasets download *name*
 ```
 
-### 3.2 运行验证
-
-再下载完数据集后可以使用该指令检测任务是否能够运行
+### 4.2 运行验证
 
 ```bash
-harbor run -d terminal-bench-sample  -a oracle
+harbor run -d terminal-bench-sample -a oracle
 ```
 
--d 使用已注册数据集
-
--a 使用何种agent架构，oracle是数据集提供的解决方案
-
-要在这些数据集上评测某个智能体和模型，可以使用如下命令：
-
-```
-harbor run -d "<dataset@version>" -m "<model>" -a "<agent>"
-```
-
-### 3.3 启动实际任务
-
-配置
-
-使用数据集hello-world
-
-agent架构terminus-2
-
-model选择deepseek/deepseek-chat
+### 4.3 运行标准任务
 
 ```bash
 harbor run -d hello-world -m deepseek/deepseek-chat -a terminus-2
 ```
 
--m 设定所使用的模型
-
-### 3.4 从自构建数据集中启动任务
+### 4.4 从本地数据集启动任务
 
 ```bash
-harbor run -p *path* -m deepseek/deepseek-chat -a terminus-2
+harbor run -p <path> -m deepseek/deepseek-chat -a terminus-2
 ```
 
--p 代表本地数据集的路径，内部结构应符合harbor给出的标准：内部多个子目录，每个目录代指一个测试
+路径下每个子目录代表一个测试任务，根目录需包含 `task.toml`。
 
-可以使用相对路径，但建议填入绝对路径
+### 4.5 使用 openclaw
 
-### 3.5 使用openclaw
-
-openclaw已被注册，可以直接使用，目前还没有对其全部功能进行测试
+openclaw v2026.5.5 已接入并注册，支持上述所有 provider：
 
 ```bash
 harbor run -d hello-world -m deepseek/deepseek-chat -a openclaw
+harbor run -d hello-world -m dashscope/qwen-plus -a openclaw
+harbor run -d hello-world -m anthropic/claude-opus-4-8 -a openclaw
 ```
 
+> 使用非 Anthropic 模型时建议加 `--skip-api-preflight`。
 
+## 05 SkillSafetyBench 实验
+
+```bash
+cd skill-safety-bench
+
+# 运行单个 risk domain
+bash scripts/start_agent_batch.sh \
+  --rd 1 --agent openclaw \
+  --model deepseek/deepseek-chat \
+  --skip-api-preflight
+
+# 调试单个 case
+bash scripts/start_agent_batch.sh \
+  --rd 1 \
+  --case offer_letter_routing_cue_precleared_merge_sheet \
+  --agent openclaw --model dashscope/qwen-plus \
+  --skip-api-preflight
+
+# 干跑
+bash scripts/start_agent_batch.sh --rd 1 --agent openclaw --dry-run
+```
+
+结果在 `jobs/.../attack_results.json`，关注 `attack_success_count`（越少越好）。
 
 ## 示例：运行 Terminal-Bench-2.0
 
-Harbor 是 [Terminal-Bench-2.0](https://github.com/laude-institute/terminal-bench-2) 的官方运行工具：
-
-```
+```bash
 export ANTHROPIC_API_KEY=<你的密钥>
 harbor run --dataset terminal-bench@2.0 \
    --agent claude-code \
-   --model anthropic/claude-opus-4-1 \
+   --model anthropic/claude-opus-4-8 \
    --n-concurrent 4
 ```
 
-这将在本地通过 Docker 启动基准测试。若要在云服务商（如 Daytona）上运行，只需加上 `--env` 参数：
+云端运行（Daytona）：
 
-```
+```bash
 export ANTHROPIC_API_KEY=<你的密钥>
 export DAYTONA_API_KEY=<你的密钥>
 harbor run --dataset terminal-bench@2.0 \
    --agent claude-code \
-   --model anthropic/claude-opus-4-1 \
+   --model anthropic/claude-opus-4-8 \
    --n-concurrent 100 \
    --env daytona
 ```
+
 
 

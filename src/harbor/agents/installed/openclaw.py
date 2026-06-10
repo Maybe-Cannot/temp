@@ -1,54 +1,18 @@
-"""OpenClaw 适配器（Harbor 集成版）。
+"""OpenClaw installed agent (Harbor integration)."""
 
-整体作用
---------
-将 Harbor 的 Agent 执行接口转换为 OpenClaw CLI 的调用流程，并在运行后把
-OpenClaw 输出还原为 Harbor 可消费的上下文统计与 ATIF 轨迹文件。
-
-代码结构（按功能模块划分）
-------------------------
-1) 常量与后端规格定义
-    - 输入：环境变量、固定路径常量
-    - 输出：运行时参数对象 `CliBackendSpec`
-    - 作用：约束 CLI 参数、输出模式、会话参数与额外环境变量。
-
-2) 运行时配置生成模块
-    - 输入：`model_name`、环境变量、Agent 基础属性
-    - 输出：OpenClaw 配置字典（写入 `openclaw.json`）
-    - 作用：生成 provider/model 配置、agent 配置、可选插件配置。
-
-3) 执行命令构建模块
-    - 输入：任务指令文本、运行模式（legacy/cli-backend）、后端规格
-    - 输出：`list[ExecInput]` 命令序列
-    - 作用：构建安装前置命令、主执行命令、统一日志和 transcript 拷贝后处理。
-
-4) 结果解析与上下文回填模块
-    - 输入：`openclaw.txt`、stderr、session 轨迹文件
-    - 输出：`AgentContext` 令牌统计、`trajectory.json`、兼容产物目录
-    - 作用：解析 json/jsonl/text 输出，提取 usage/session/model，并回填 Harbor 上下文。
-
-5) transcript 发现与 ATIF 转换模块
-    - 输入：session id、session 目录下 jsonl 事件流
-    - 输出：`Trajectory | None`
-    - 作用：定位最新 transcript，解析 tool_use/tool_result，生成结构化 ATIF 步骤。
-
-6) 兼容产物与日志模块
-    - 输入：解析后的结果与轨迹
-    - 输出：episode 目录、结构化 job/trial 日志、清理后的输出目录
-    - 作用：提供与 Harbor 现有观测链路兼容的调试与结果文件。
-"""
-
-from __future__ import annotations
-
+import copy
+import inspect
 import json
-import os
 import shlex
-from datetime import datetime, timezone
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    CliFlag,
+    with_prompt_template,
+)
+from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
 from harbor.models.trajectories import (
@@ -63,2256 +27,954 @@ from harbor.models.trajectories import (
 )
 from harbor.utils.trajectory_utils import format_trajectory_json
 
-_STATE_DIR = "/tmp/openclaw-state"
-_DEFAULT_AGENT_ID = "harbor-task"
-_WORKSPACE_DIR = "/app"
-_SKILLS_DIR = f"{_WORKSPACE_DIR}/skills"
-_MCPORTER_CONFIG = "/root/.mcporter/mcporter.json"
-_COPIED_TRANSCRIPT_FILENAME = "openclaw-session.jsonl"
-_PLUGIN_INSPECT_FILENAME = "openclaw-plugins.json"
-_PLUGIN_INSPECT_FILENAME = "openclaw-plugins.json"
-
-_OPENAI_COMPAT_BASE_URLS: dict[str, str] = {
-    "deepseek": "https://api.deepseek.com/v1",
-    "together": "https://api.together.xyz/v1",
-    "groq": "https://api.groq.com/openai/v1",
-    "fireworks": "https://api.fireworks.ai/inference/v1",
-    "perplexity": "https://api.perplexity.ai",
-}
+OPENCLAW_AGENT_SETUP_TIMEOUT_SEC = 1200.0
+_OPENCLAW_DEFAULT_VERSION = "2026.5.5"
 
 
-@dataclass
-class CliBackendSpec:
-    """CLI 后端规格。
+def openclaw_session_jsonl_to_atif_steps(
+    path: Path | str,
+    *,
+    instruction: str,
+    model_name: str,
+) -> list[Step] | None:
+    """Map "openclaw.session.jsonl" message lines to ATIF "Step" objects (optional).
 
-    输入：环境变量解析结果。
-    输出：规范化后的命令参数/模式/环境配置。
-    作用：避免在命令拼接阶段直接散落读取环境变量，集中约束默认值与容错行为。
+    Call this when you want a multi-step view instead of the summarized OpenClaw CLI
+    JSON envelope. Returns "None" if the file is missing, unreadable, or has no
+    usable "type: message" rows. Does not validate against the full ATIF schema beyond
+    "Step" construction.
     """
+    path = Path(path)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
 
-    """CLI 后端规格。
-
-    输入：环境变量解析结果。
-    输出：规范化后的命令参数/模式/环境配置。
-    作用：避免在命令拼接阶段直接散落读取环境变量，集中约束默认值与容错行为。
-    """
-
-    command: str
-    args: list[str]
-    resume_args: list[str]
-    output_mode: str
-    input_mode: str
-    max_prompt_arg_chars: int
-    session_mode: str
-    session_arg: str
-    session_args: list[str]
-    extra_env: dict[str, str]
-    clear_env: list[str]
-
-    @classmethod
-    def from_env(cls, env: dict[str, str]) -> "CliBackendSpec":
-        """从环境变量构建 CLI 后端规格。
-
-        输入：`env`（通常为 `os.environ` 与外部注入变量的合并结果）。
-        输出：`CliBackendSpec` 实例。
-        作用：完成字符串/JSON/CSV 类型参数归一化，并提供合法值兜底。
-        """
-
-        """从环境变量构建 CLI 后端规格。
-
-        输入：`env`（通常为 `os.environ` 与外部注入变量的合并结果）。
-        输出：`CliBackendSpec` 实例。
-        作用：完成字符串/JSON/CSV 类型参数归一化，并提供合法值兜底。
-        """
-
-        def _json_list(name: str, default: list[str]) -> list[str]:
-            raw = (env.get(name) or "").strip()
-            if not raw:
-                return default
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    return [str(x) for x in parsed]
-            except json.JSONDecodeError:
-                pass
-            return default
-
-        def _csv(name: str, default: list[str]) -> list[str]:
-            raw = (env.get(name) or "").strip()
-            if not raw:
-                return default
-            return [part.strip() for part in raw.split(",") if part.strip()]
-
-        def _json_obj(name: str) -> dict[str, str]:
-            raw = (env.get(name) or "").strip()
-            if not raw:
-                return {}
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    return {str(k): str(v) for k, v in parsed.items()}
-            except json.JSONDecodeError:
-                pass
-            return {}
-
-        output_mode = (env.get("OPENCLAW_OUTPUT_MODE") or "json").strip().lower()
-        if output_mode not in {"json", "jsonl", "text"}:
-            output_mode = "json"
-
-        input_mode = (env.get("OPENCLAW_INPUT_MODE") or "arg").strip().lower()
-        if input_mode not in {"arg", "stdin"}:
-            input_mode = "arg"
-
-        session_mode = (env.get("OPENCLAW_SESSION_MODE") or "always").strip().lower()
-        if session_mode not in {"always", "existing", "none"}:
-            session_mode = "always"
-
-        max_prompt = 6000
-        try:
-            max_prompt = int((env.get("OPENCLAW_MAX_PROMPT_ARG_CHARS") or "6000").strip())
-        except ValueError:
-            max_prompt = 6000
-
-        return cls(
-            command=(env.get("OPENCLAW_CLI_COMMAND") or "openclaw").strip(),
-            args=_json_list("OPENCLAW_CLI_ARGS_JSON", ["agent", "--json"]),
-            resume_args=_json_list("OPENCLAW_CLI_RESUME_ARGS_JSON", []),
-            output_mode=output_mode,
-            input_mode=input_mode,
-            max_prompt_arg_chars=max(100, max_prompt),
-            session_mode=session_mode,
-            session_arg=(env.get("OPENCLAW_SESSION_ARG") or "--session-id").strip(),
-            session_args=_json_list("OPENCLAW_SESSION_ARGS_JSON", []),
-            extra_env=_json_obj("OPENCLAW_BACKEND_ENV_JSON"),
-            clear_env=_csv("OPENCLAW_BACKEND_CLEAR_ENV", []),
+    def _text_from_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        return "".join(
+            p["text"]
+            for p in content
+            if isinstance(p, dict)
+            and p.get("type") == "text"
+            and isinstance(p.get("text"), str)
         )
 
+    def _assistant_parts(content: Any) -> tuple[str, list[ToolCall]]:
+        if not isinstance(content, list):
+            return "", []
+        texts: list[str] = []
+        tools: list[ToolCall] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text" and isinstance(p.get("text"), str):
+                texts.append(p["text"])
+            elif p.get("type") == "toolCall" and isinstance(p.get("name"), str):
+                raw = p.get("arguments", "")
+                if isinstance(raw, str):
+                    try:
+                        args: dict[str, Any] = json.loads(raw) if raw.strip() else {}
+                    except json.JSONDecodeError:
+                        args = {"raw": raw}
+                elif isinstance(raw, dict):
+                    args = raw
+                else:
+                    args = {}
+                cid = p.get("id")
+                tools.append(
+                    ToolCall(
+                        tool_call_id=str(cid) if cid is not None else "",
+                        function_name=p["name"],
+                        arguments=args,
+                    )
+                )
+        return "".join(texts), tools
 
-class Openclaw(BaseInstalledAgent):
-    """OpenClaw 适配器实现（同时支持 legacy 与 cli-backend 两种运行模式）。"""
-    """OpenClaw 适配器实现（同时支持 legacy 与 cli-backend 两种运行模式）。"""
+    def _usage_metrics(usage: Any) -> Metrics | None:
+        if not isinstance(usage, dict):
+            return None
+        inp = int(usage.get("input") or 0)
+        out = int(usage.get("output") or 0)
+        cr = int(usage.get("cacheRead") or 0)
+        cw = int(usage.get("cacheWrite") or 0)
+        if not (inp or out or cr):
+            return None
+        return Metrics(
+            prompt_tokens=inp + cr or None,
+            completion_tokens=out or None,
+            cached_tokens=cr or None,
+            extra=({"cache_write_tokens": cw} if cw else None),
+        )
+
+    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("type") != "message":
+            continue
+        inner = rec.get("message")
+        if not isinstance(inner, dict):
+            continue
+        role = inner.get("role")
+        if role in ("user", "assistant", "toolResult"):
+            rows.append((rec, inner))
+
+    if not rows:
+        return None
+
+    steps: list[Step] = []
+    sid = 0
+    first_user = True
+    i = 0
+    while i < len(rows):
+        rec, msg = rows[i]
+        ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else None
+        role = msg.get("role")
+
+        if role == "user":
+            body = _text_from_content(msg.get("content"))
+            user_msg = (
+                instruction.strip() if (first_user and instruction.strip()) else body
+            )
+            first_user = False
+            sid += 1
+            steps.append(
+                Step(
+                    step_id=sid,
+                    source="user",
+                    message=user_msg or "(empty user message)",
+                    timestamp=ts,
+                )
+            )
+            i += 1
+            continue
+
+        if role == "assistant":
+            text, tools = _assistant_parts(msg.get("content"))
+            err = msg.get("errorMessage")
+            if text.strip():
+                agent_msg = text.strip()
+            elif isinstance(err, str) and err.strip():
+                agent_msg = f"(error) {err.strip()}"
+            else:
+                agent_msg = "(no assistant text)"
+
+            j = i + 1
+            pending = {t.tool_call_id for t in tools if t.tool_call_id}
+            ob: list[ObservationResult] = []
+            while j < len(rows) and rows[j][1].get("role") == "toolResult":
+                tr = rows[j][1]
+                cid = str(tr.get("toolCallId") or "")
+                if cid not in pending:
+                    break
+                details = tr.get("details")
+                body_t = ""
+                if isinstance(details, dict):
+                    agg = details.get("aggregated")
+                    if isinstance(agg, str) and agg.strip():
+                        body_t = agg
+                if not body_t:
+                    body_t = _text_from_content(tr.get("content"))
+                ob.append(
+                    ObservationResult(
+                        source_call_id=cid or None, content=body_t or None
+                    )
+                )
+                pending.discard(cid)
+                j += 1
+                if not pending:
+                    break
+
+            sid += 1
+            steps.append(
+                Step(
+                    step_id=sid,
+                    source="agent",
+                    message=agent_msg,
+                    timestamp=ts,
+                    model_name=model_name,
+                    tool_calls=tools or None,
+                    observation=Observation(results=ob) if ob else None,
+                    metrics=_usage_metrics(msg.get("usage")),
+                )
+            )
+            i = j
+            continue
+
+        i += 1
+
+    if len(steps) < 2:
+        return None
+    return steps
+
+
+def _openclaw_decode_last_json_dict_suffix(raw: str):
+    """Parse the last top-level JSON object in *raw* when it consumes the rest of the string.
+
+    Host-side helper for parsing openclaw.txt's last JSON object.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    dec = json.JSONDecoder()
+    for start in range(len(text) - 1, -1, -1):
+        if text[start] != "{":
+            continue
+        try:
+            obj, consumed = dec.raw_decode(text[start:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if text[start + consumed :].strip():
+            continue
+        return obj
+    return None
+
+
+def _openclaw_container_copy_session_transcript() -> None:
+    """
+    Stdlib-only logic run inside the agent container ("python3 -c").
+    Serialized via "inspect.getsource" as a **single** self-contained function.
+    Parse "openclaw.txt" by finding the last JSON object that consumes the file suffix,
+    then copy "agentMeta.sessionFile".
+    """
+    import json
+    import shutil
+    import sys
+    from pathlib import Path
+
+    log_path = Path("/logs/agent/openclaw.txt")
+    if not log_path.is_file():
+        sys.exit(0)
+    raw = log_path.read_text(encoding="utf-8", errors="replace")
+    text = raw.strip()
+    if not text:
+        sys.exit(0)
+    dec = json.JSONDecoder()
+    envelope = None
+    for start in range(len(text) - 1, -1, -1):
+        if text[start] != "{":
+            continue
+        try:
+            obj, consumed = dec.raw_decode(text[start:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if text[start + consumed :].strip():
+            continue
+        envelope = obj
+        break
+    if not envelope:
+        sys.exit(0)
+    meta = envelope.get("meta")
+    if not isinstance(meta, dict):
+        sys.exit(0)
+    agent_meta = meta.get("agentMeta")
+    if not isinstance(agent_meta, dict):
+        sys.exit(0)
+    session_file = agent_meta.get("sessionFile")
+    if not isinstance(session_file, str) or not session_file.strip():
+        sys.exit(0)
+    src = Path(session_file)
+    if not src.is_file():
+        sys.exit(0)
+    dst = Path("/logs/agent") / "openclaw.session.jsonl"
+    shutil.copy2(src, dst)
+
+
+def _nvm22(cmd: str) -> str:
+    return f". ~/.nvm/nvm.sh && nvm use 22 && {cmd}"
+
+
+class OpenClaw(BaseInstalledAgent):
+    """
+    OpenClaw in Harbor: "openclaw agent --local --json" (stdout is one JSON object).
+
+    Host writes merged config as "openclaw.upload.json"; after "openclaw setup" it is
+    copied to "~/.openclaw/openclaw.json". Session JSONL is copied to
+    "/logs/agent/openclaw.session.jsonl" when available.
+
+    Supported providers (see :attr:`_SUPPORTED_PROVIDERS`): ``anthropic``,
+    ``nvidia``, ``openai``. All three use the OpenAI-compatible chat API
+    and follow the ``<PROVIDER>_API_KEY`` / ``<PROVIDER>_BASE_URL`` env-var
+    convention, so for a "<provider>/<model>" selection
+    (e.g. "openai/gpt-4.1"):
+
+    * "<PROVIDER>_API_KEY" and "<PROVIDER>_BASE_URL" are forwarded into the
+      container when set.
+    * "<PROVIDER>_BASE_URL" is merged into
+      "models.providers.<provider>.baseUrl" when not already configured.
+    * The OpenClaw "models" array under the matching provider is populated
+      from "--model" when missing.
+
+    Headless runs append "message" to "tools.deny". To add a provider,
+    subclass and extend :attr:`_SUPPORTED_PROVIDERS` (and override
+    :meth:`_provider_env_keys` if its env scheme differs from the
+    convention).
+
+    "session_to_trajectory": when true (default), prefers "openclaw.session.jsonl" for tragectory generation
+    otherwise the summarized CLI envelope is used.
+
+    "failover_retries": optional non-negative int merged into
+    "auth.cooldowns.rateLimitedProfileRotations" in the uploaded OpenClaw config.
+
+    https://github.com/openclaw/openclaw - Node 22.16+ or 24.
+    """
 
     SUPPORTS_ATIF: bool = True
-    _OUTPUT_FILENAME = "openclaw.txt"
 
-    def __init__(self, *args, **kwargs) -> None:
+    # Host-written full config; trial mounts logs here as /logs/agent - copied into ~/.openclaw/
+    _UPLOAD_CONFIG_FILENAME = "openclaw.upload.json"
+    _CONTAINER_LOGS_AGENT = "/logs/agent"
+
+    # Minimal shape matching "openclaw setup --workspace ." (see OpenClaw setupCommand).
+    _SETUP_BASELINE: dict[str, Any] = {
+        "agents": {"defaults": {"workspace": "."}},
+        "gateway": {"mode": "local"},
+    }
+
+    CLI_FLAGS = [
+        # OpenClaw's embedded CLI requires a session target; default install uses agent "main".
+        CliFlag("openclaw_agent_id", cli="--agent", type="str", default="main"),
+        CliFlag("thinking", cli="--thinking", type="str", default="high"),
+        CliFlag("timeout", cli="--timeout", type="int"),
+    ]
+
+    _DEFAULT_CONFIG: dict[str, Any] = {}
+
+    # OpenClaw tool ids to deny in Harbor (no messaging channel in "--local" runs).
+    _HEADLESS_TOOL_DENY: tuple[str, ...] = ("message",)
+
+    # Providers supported out of the box. Each must follow the
+    # ``<PROVIDER>_API_KEY`` / ``<PROVIDER>_BASE_URL`` env-var convention.
+    # Subclass and override to add more (and override :meth:`_provider_env_keys`
+    # if a new provider's env scheme deviates from the convention).
+    _SUPPORTED_PROVIDERS: frozenset[str] = frozenset({
+        "anthropic", "nvidia", "openai",
+        "deepseek", "dashscope", "moonshot", "zai",
+    })
+
+    @classmethod
+    def _provider_env_keys(cls, provider: str) -> tuple[str, ...]:
+        """Return the env vars to forward for ``provider``.
+
+        Default convention is ``<PROVIDER>_API_KEY`` and ``<PROVIDER>_BASE_URL``
+        (with ``-`` replaced by ``_``). Override in a subclass for providers
+        whose env scheme differs (e.g. AWS Bedrock, Azure, Google Vertex).
+        """
+        prefix = cls._provider_env_prefix(provider)
+        return (f"{prefix}_API_KEY", f"{prefix}_BASE_URL")
+
+    @classmethod
+    def _validate_provider(cls, provider: str) -> None:
+        """Raise ``ValueError`` if ``provider`` isn't in :attr:`_SUPPORTED_PROVIDERS`."""
+        if provider not in cls._SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Unsupported provider {provider!r}. Supported providers: "
+                f"{sorted(cls._SUPPORTED_PROVIDERS)}. Subclass OpenClaw and "
+                "extend `_SUPPORTED_PROVIDERS` to add more."
+            )
+
+    def __init__(
+        self,
+        *args,
+        openclaw_config: dict[str, Any] | None = None,
+        **kwargs,
+    ):
+        override_setup_timeout_sec = kwargs.pop("override_setup_timeout_sec", None)
+        self._use_openclaw_session_jsonl_for_steps = bool(
+            kwargs.pop("session_to_trajectory", True)
+        )
+        raw_fr = kwargs.pop("failover_retries", None)
+        self._failover_retries: int | None = None
+        if raw_fr is not None:
+            self._failover_retries = int(raw_fr)
+            if self._failover_retries < 0:
+                raise ValueError("failover_retries must be non-negative")
+        self._install_exec_timeout_sec = int(
+            override_setup_timeout_sec or OPENCLAW_AGENT_SETUP_TIMEOUT_SEC
+        )
         super().__init__(*args, **kwargs)
-        if not hasattr(self, "skills_dir"):
-            self.skills_dir: str | None = kwargs.get("skills_dir")
-        if not hasattr(self, "mcp_servers"):
-            self.mcp_servers: list = list(kwargs.get("mcp_servers") or [])
+        self._openclaw_config: dict[str, Any] = openclaw_config or {}
+
+    @staticmethod
+    def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                OpenClaw._deep_merge(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    @classmethod
+    def _merge_harbor_headless_tool_denies(cls, cfg: dict[str, Any]) -> None:
+        """Append Harbor headless denies to "tools.deny" without dropping user entries."""
+        raw_tools = cfg.get("tools")
+        if not isinstance(raw_tools, dict):
+            cfg["tools"] = {"deny": list(cls._HEADLESS_TOOL_DENY)}
+            return
+        deny = raw_tools.get("deny")
+        if deny is None:
+            raw_tools["deny"] = list(cls._HEADLESS_TOOL_DENY)
+            return
+        if not isinstance(deny, list):
+            raw_tools["deny"] = list(cls._HEADLESS_TOOL_DENY)
+            return
+        seen: set[str] = set()
+        merged: list[str] = []
+        for item in deny:
+            if isinstance(item, str) and item not in seen:
+                seen.add(item)
+                merged.append(item)
+        for name in cls._HEADLESS_TOOL_DENY:
+            if name not in seen:
+                seen.add(name)
+                merged.append(name)
+        raw_tools["deny"] = merged
+
+    @staticmethod
+    def _shell_copy_openclaw_session_to_logs() -> str:
+        """Container command: parse "openclaw.txt" JSON, copy "agentMeta.sessionFile" to logs."""
+        body = inspect.getsource(_openclaw_container_copy_session_transcript)
+        script = body + "\n_openclaw_container_copy_session_transcript()\n"
+        return "python3 -c " + shlex.quote(script)
+
+    async def _copy_openclaw_session_file_to_agent_logs(
+        self, environment: BaseEnvironment, env: dict[str, str]
+    ) -> None:
+        """Copy OpenClaw session JSONL into the trial agent logs mount (best-effort)."""
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=self._shell_copy_openclaw_session_to_logs(),
+                env=env,
+            )
+        except Exception:
+            self.logger.debug(
+                "Could not copy OpenClaw session file to "
+                f"{self._CONTAINER_LOGS_AGENT}/openclaw.session.jsonl (non-fatal)",
+                exc_info=True,
+            )
 
     @staticmethod
     def name() -> str:
         return AgentName.OPENCLAW.value
 
-    def version(self) -> str:
-        return self._version or "latest"
+    def get_version_command(self) -> str | None:
+        return _nvm22("openclaw --version")
 
-    @property
-    def _install_agent_template_path(self) -> Path:
-        return Path(__file__).parent / "install-openclaw.sh.j2"
-
-    def _runtime_mode(self) -> str:
-        # 模块：运行模式解析
-        # 输入：OPENCLAW_BACKEND_MODE（来自运行时环境）
-        # 输出：legacy / cli-backend
-        # 作用：在未识别值时回退 legacy，保证兼容默认链路。
-        # 模块：运行模式解析
-        # 输入：OPENCLAW_BACKEND_MODE（来自运行时环境）
-        # 输出：legacy / cli-backend
-        # 作用：在未识别值时回退 legacy，保证兼容默认链路。
-        mode = (self._extra_env.get("OPENCLAW_BACKEND_MODE") or os.environ.get("OPENCLAW_BACKEND_MODE") or "legacy").strip().lower()
-        if mode not in {"legacy", "cli-backend"}:
-            return "legacy"
-        return mode
-
-    def _runtime_env(self) -> dict[str, str]:
-        return {**os.environ, **self._extra_env}
-
-    def _build_openclaw_config(self) -> dict[str, Any]:
-        """构建 OpenClaw 配置对象。
-
-        输入：`self.model_name` 与运行时环境变量。
-        输出：可序列化的 OpenClaw 配置字典。
-        作用：统一 provider/model 解析、API 鉴权来源、agent 默认配置及插件开关。
-        """
-
-        """构建 OpenClaw 配置对象。
-
-        输入：`self.model_name` 与运行时环境变量。
-        输出：可序列化的 OpenClaw 配置字典。
-        作用：统一 provider/model 解析、API 鉴权来源、agent 默认配置及插件开关。
-        """
-
-        if not self.model_name or "/" not in self.model_name:
-            raise ValueError(
-                "model_name must be in 'provider/model' format, "
-                f"got: {self.model_name!r}"
-            )
-
-        provider, model = self.model_name.split("/", 1)
-        env = self._runtime_env()
-        memory_slot = (env.get("OPENCLAW_MEMORY_PLUGIN_SLOT") or "none").strip() or "none"
-        plugins_enabled_raw = (env.get("OPENCLAW_PLUGINS_ENABLED") or "").strip().lower()
-        plugins_enabled = plugins_enabled_raw in {"1", "true", "yes", "on"}
-
-        match provider:
-            case "anthropic":
-                api_type: str | None = "anthropic-messages"
-                base_url = env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-                api_key_env = "ANTHROPIC_API_KEY"
-            case "openai":
-                api_type = "openai-completions"
-                base_url = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-                api_key_env = "OPENAI_API_KEY"
-            case "openrouter":
-                api_type = "openai-completions"
-                base_url = env.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                api_key_env = "OPENROUTER_API_KEY"
-            case _:
-                api_type = "openai-completions"
-                base_url = env.get(
-                    f"{provider.upper()}_BASE_URL",
-                    env.get(
-                        "OPENAI_BASE_URL",
-                        _OPENAI_COMPAT_BASE_URLS.get(provider.lower(), ""),
-                    ),
-                )
-                if not base_url:
-                    raise ValueError(
-                        f"Cannot resolve base URL for provider '{provider}'. "
-                        f"Set {provider.upper()}_BASE_URL or OPENAI_BASE_URL."
-                    )
-                api_key_env = f"{provider.upper()}_API_KEY"
-
-        config: dict[str, Any] = {
-            "models": {
-                "providers": {
-                    provider: {
-                        "baseUrl": base_url,
-                        "apiKey": {
-                            "source": "env",
-                            "provider": "default",
-                            "id": api_key_env,
-                        },
-                        "models": [
-                            {
-                                "id": model,
-                                "name": model,
-                                "reasoning": False,
-                                "input": ["text"],
-                                "cost": {
-                                    "input": 0,
-                                    "output": 0,
-                                    "cacheRead": 0,
-                                    "cacheWrite": 0,
-                                },
-                                "contextWindow": 200000,
-                                "maxTokens": 8192,
-                            }
-                        ],
-                        **({"api": api_type} if api_type else {}),
-                    }
-                }
-            },
-            "agents": {
-                "list": [
-                    {
-                        "id": self._resolve_agent_id(),
-                        "default": True,
-                        "model": f"{provider}/{model}",
-                        "workspace": _WORKSPACE_DIR,
-                    }
-                ]
-            },
-        }
-
-        # 仅在显式要求时才输出 plugins 配置。
-        # 某些 OpenClaw 版本会在检测到 plugins 配置后主动触发插件发现/校验，
-        # 在受限运行镜像中可能在 agent 启动前失败，因此默认不写入该段。
-        # 仅在显式要求时才输出 plugins 配置。
-        # 某些 OpenClaw 版本会在检测到 plugins 配置后主动触发插件发现/校验，
-        # 在受限运行镜像中可能在 agent 启动前失败，因此默认不写入该段。
-        explicit_plugins_enabled = "OPENCLAW_PLUGINS_ENABLED" in env
-        explicit_memory_slot = "OPENCLAW_MEMORY_PLUGIN_SLOT" in env
-        if explicit_plugins_enabled or explicit_memory_slot:
-            plugins_config: dict[str, Any] = {
-                "enabled": plugins_enabled,
-            }
-            if memory_slot != "none":
-                plugins_config["slots"] = {"memory": memory_slot}
-            config["plugins"] = plugins_config
-
-        return config
-
-    def _resolve_agent_id(self) -> str:
-        env = self._runtime_env()
-        agent_id = (env.get("OPENCLAW_AGENT_ID") or _DEFAULT_AGENT_ID).strip()
-        return agent_id or _DEFAULT_AGENT_ID
-
-    def _resolve_api_key_env(self) -> tuple[str, str]:
-        if not self.model_name or "/" not in self.model_name:
-            return "", ""
-
-        provider = self.model_name.split("/", 1)[0]
-        match provider:
-            case "anthropic":
-                key = "ANTHROPIC_API_KEY"
-            case "openai":
-                key = "OPENAI_API_KEY"
-            case "openrouter":
-                key = "OPENROUTER_API_KEY"
-            case _:
-                key = f"{provider.upper()}_API_KEY"
-
-        env = self._runtime_env()
-        return key, env.get(key, "")
-
-    def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
-        """构建 Harbor 执行阶段所需命令序列。
-
-        输入：`instruction`（用户任务指令）。
-        输出：按顺序执行的 `ExecInput` 列表。
-        作用：根据运行模式拼装主命令，并注入统一的日志采集和 transcript 拷贝后处理。
-        """
-
-        """构建 Harbor 执行阶段所需命令序列。
-
-        输入：`instruction`（用户任务指令）。
-        输出：按顺序执行的 `ExecInput` 列表。
-        作用：根据运行模式拼装主命令，并注入统一的日志采集和 transcript 拷贝后处理。
-        """
-
-        if not self.model_name or "/" not in self.model_name:
-            raise ValueError(
-                "model_name must be in 'provider/model' format, "
-                f"got: {self.model_name!r}"
-            )
-
-        mode = self._runtime_mode()
-        env = {"OPENCLAW_STATE_DIR": _STATE_DIR}
-
-        key_name, key_value = self._resolve_api_key_env()
-        if key_value:
-            env[key_name] = key_value
-
-        commands: list[ExecInput] = []
-
-        if mode == "legacy":
-            config = self._build_openclaw_config()
-            config_json = json.dumps(config, indent=2, ensure_ascii=False)
-            commands.append(
-                ExecInput(
-                    command=(
-                        f"mkdir -p {_STATE_DIR} && "
-                        f"cat > {_STATE_DIR}/openclaw.json << 'HARBOR_EOF'\n"
-                        f"{config_json}\n"
-                        "HARBOR_EOF"
-                    ),
-                    env=env,
-                    timeout_sec=30,
-                )
-            )
-
-            mcp_cmd = self._build_register_mcp_servers_command(mode=mode)
-            if mcp_cmd:
-                commands.append(ExecInput(command=mcp_cmd, env=env, timeout_sec=30))
-
-            skills_cmd = self._build_register_skills_command()
-            if skills_cmd:
-                commands.append(ExecInput(command=skills_cmd, env=env, timeout_sec=30))
-
-            plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
-            if plugin_inspect_cmd:
-                commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
-
-            plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
-            if plugin_inspect_cmd:
-                commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
-
-            escaped_instruction = shlex.quote(instruction)
-            base_command = (
-                ". ~/.nvm/nvm.sh 2>/dev/null || true; "
-                "openclaw agent --local --json "
-                f"--agent {shlex.quote(self._resolve_agent_id())} "
-                f"--message {escaped_instruction}"
-            )
-            commands.append(
-                ExecInput(
-                    command=self._wrap_agent_exec_command(base_command),
-                    env=env,
-                )
-            )
-            return commands
-
-        backend = CliBackendSpec.from_env(self._runtime_env())
-
-        mcp_cmd = self._build_register_mcp_servers_command(mode=mode)
-        if mcp_cmd:
-            commands.append(ExecInput(command=mcp_cmd, env=env, timeout_sec=30))
-
-        skills_cmd = self._build_register_skills_command()
-        if skills_cmd:
-            commands.append(ExecInput(command=skills_cmd, env=env, timeout_sec=30))
-
-        plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
-        if plugin_inspect_cmd:
-            commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
-
-        plugin_inspect_cmd = self._build_capture_plugin_inventory_command()
-        if plugin_inspect_cmd:
-            commands.append(ExecInput(command=plugin_inspect_cmd, env=env, timeout_sec=30))
-
-        cmd, cmd_env = self._build_cli_backend_command(instruction, backend)
-        merged_env = {**env, **cmd_env}
-        commands.append(
-            ExecInput(
-                command=self._wrap_agent_exec_command(cmd),
-                env=merged_env,
-            )
+    async def install(self, environment: BaseEnvironment) -> None:
+        root_pkgs = "curl ca-certificates"
+        await self.exec_as_root(
+            environment,
+            command=(
+                f"apt-get update && apt-get install -y --no-install-recommends {root_pkgs}"
+            ),
+            env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-        return commands
-
-    def _wrap_agent_exec_command(self, base_command: str) -> str:
-        """统一包装执行命令。
-
-        输入：`base_command`（不带日志重定向与收尾处理的 OpenClaw 主命令）。
-        输出：可直接交给 shell 执行的完整命令字符串。
-        作用：
-        1) 保留管道前主进程退出码；
-        2) 统一落盘 stdout/stderr；
-        3) 复制最新 transcript，供后续 ATIF 转换使用。
-        """
-
-        """统一包装执行命令。
-
-        输入：`base_command`（不带日志重定向与收尾处理的 OpenClaw 主命令）。
-        输出：可直接交给 shell 执行的完整命令字符串。
-        作用：
-        1) 保留管道前主进程退出码；
-        2) 统一落盘 stdout/stderr；
-        3) 复制最新 transcript，供后续 ATIF 转换使用。
-        """
-
-        return (
-            "set -o pipefail; "
-            f"{base_command} "
-            "2>/tmp/openclaw-stderr.raw "
-            "| tee /logs/agent/openclaw.txt; "
-            "rc=${PIPESTATUS[0]}; "
-            "grep -Evi 'plugin id mismatch|Unable to resolve plugin runtime module' "
-            "/tmp/openclaw-stderr.raw > /logs/agent/openclaw-stderr.txt || true; "
-            "mkdir -p /logs/agent/openclaw-state 2>/dev/null || true; "
-            f"cp -a {_STATE_DIR}/agents /logs/agent/openclaw-state/ 2>/dev/null || true; "
-            f"latest_session=\"$(ls -1t {_STATE_DIR}/agents/*/sessions/*.jsonl {_STATE_DIR}/agents/*/sessions/*.jsonl.reset.* 2>/dev/null | head -n1 || true)\"; "
-            f"[ -n \"$latest_session\" ] && cp \"$latest_session\" /logs/agent/{_COPIED_TRANSCRIPT_FILENAME} || true; "
-            "chmod -R a+rX /logs/agent/ 2>/dev/null || true"
-            "; exit $rc"
+        timeout = self._install_exec_timeout_sec
+        await self.exec_as_agent(
+            environment,
+            command=(
+                "set -o pipefail; "
+                "retry_all=$(curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' && echo '--retry-all-errors'); "
+                "curl -fsSL --retry 5 --retry-delay 2 $retry_all "
+                "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh "
+                "| bash"
+            ),
+            timeout_sec=timeout,
+        )
+        await self.exec_as_agent(
+            environment,
+            command=(
+                'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}" && . "$NVM_DIR/nvm.sh" && nvm install 22'
+            ),
+            timeout_sec=timeout,
+        )
+        await self.exec_as_agent(
+            environment,
+            command=_nvm22("node -v && npm -v"),
+            timeout_sec=timeout,
+        )
+        version = self._version or _OPENCLAW_DEFAULT_VERSION
+        oc_pkg = shlex.quote(f"openclaw@{version}")
+        await self.exec_as_agent(
+            environment,
+            command=_nvm22(
+                f"npm install -g {oc_pkg} "
+                "--fetch-retries=5 --fetch-retry-mintimeout=20000 "
+                "--fetch-retry-maxtimeout=120000"
+            ),
+            timeout_sec=timeout,
+        )
+        await self.exec_as_agent(
+            environment,
+            command=_nvm22("openclaw --version"),
+            timeout_sec=timeout,
         )
 
-    def _build_cli_backend_command(
-        self, instruction: str, backend: CliBackendSpec
-    ) -> tuple[str, dict[str, str]]:
-        """构建 cli-backend 模式下的基础命令。
-
-        输入：`instruction` 与 `backend` 规格。
-        输出：`(command, extra_env)`。
-        作用：处理会话恢复参数、stdin/argv 输入模式，以及环境变量清理前缀。
-        """
-
-        """构建 cli-backend 模式下的基础命令。
-
-        输入：`instruction` 与 `backend` 规格。
-        输出：`(command, extra_env)`。
-        作用：处理会话恢复参数、stdin/argv 输入模式，以及环境变量清理前缀。
-        """
-
-        state = self._state_session_file()
-        previous_session = ""
-        if state.exists():
-            try:
-                previous_session = state.read_text(encoding="utf-8").strip()
-            except OSError:
-                previous_session = ""
-
-        session_id = ""
-        use_resume = False
-        if backend.session_mode == "none":
-            session_id = ""
-        elif backend.session_mode == "existing":
-            session_id = previous_session
-        else:
-            session_id = previous_session or ""
-
-        if session_id and backend.resume_args:
-            use_resume = True
-
-        args = list(backend.resume_args if use_resume else backend.args)
-        if session_id:
-            if backend.session_args:
-                args.extend(part.replace("{sessionId}", session_id) for part in backend.session_args)
-            elif backend.session_arg:
-                args.extend([backend.session_arg, session_id])
-
-        quoted_command = shlex.quote(backend.command)
-        quoted_args = " ".join(shlex.quote(part) for part in args)
-
-        instruction_arg = ""
-        stdin_prefix = ""
-        if backend.input_mode == "stdin" or len(instruction) > backend.max_prompt_arg_chars:
-            stdin_prefix = f"printf %s {shlex.quote(instruction)} | "
-        else:
-            instruction_arg = f" {shlex.quote(instruction)}"
-
-        clear_env_prefix = ""
-        if backend.clear_env:
-            clear_env_prefix = " ".join(f"unset {shlex.quote(name)};" for name in backend.clear_env) + " "
-
-        full_command = (
-            f"{clear_env_prefix}{stdin_prefix}{quoted_command} {quoted_args}{instruction_arg}"
-        ).strip()
-
-        return full_command, backend.extra_env
-
-    def _build_capture_plugin_inventory_command(self) -> str | None:
-        """构建插件清单采集命令。
-
-        输入：运行时环境变量（可通过 OPENCLAW_CAPTURE_PLUGIN_INSPECT 控制开关）。
-        输出：shell 命令字符串（关闭时返回 None）。
-        作用：将插件 inspect 结果写入日志目录，供后处理阶段做“工具名→插件”映射。
-        """
-
-        enabled_raw = (self._runtime_env().get("OPENCLAW_CAPTURE_PLUGIN_INSPECT") or "1").strip().lower()
-        if enabled_raw in {"0", "false", "no", "off"}:
+    @staticmethod
+    def _load_json_object(raw: str) -> dict[str, Any] | None:
+        text = raw.strip()
+        if not text:
             return None
-
-        return (
-            ". ~/.nvm/nvm.sh 2>/dev/null || true; "
-            "openclaw plugins inspect --all --json "
-            f"> /logs/agent/{_PLUGIN_INSPECT_FILENAME} "
-            "2>/logs/agent/openclaw-plugins-stderr.txt || true"
-        )
-
-    def _build_capture_plugin_inventory_command(self) -> str | None:
-        """构建插件清单采集命令。
-
-        输入：运行时环境变量（可通过 OPENCLAW_CAPTURE_PLUGIN_INSPECT 控制开关）。
-        输出：shell 命令字符串（关闭时返回 None）。
-        作用：将插件 inspect 结果写入日志目录，供后处理阶段做“工具名→插件”映射。
-        """
-
-        enabled_raw = (self._runtime_env().get("OPENCLAW_CAPTURE_PLUGIN_INSPECT") or "1").strip().lower()
-        if enabled_raw in {"0", "false", "no", "off"}:
-            return None
-
-        return (
-            ". ~/.nvm/nvm.sh 2>/dev/null || true; "
-            "openclaw plugins inspect --all --json "
-            f"> /logs/agent/{_PLUGIN_INSPECT_FILENAME} "
-            "2>/logs/agent/openclaw-plugins-stderr.txt || true"
-        )
-
-    def _state_session_file(self) -> Path:
-        return self.logs_dir / "openclaw-last-session-id.txt"
-
-    def populate_context_post_run(self, context: AgentContext) -> None:
-        """运行后回填 Harbor 上下文并生成兼容产物。
-
-        输入：`AgentContext`（待填充对象）与运行日志目录中的输出文件。
-        输出：更新后的 `context`、可选 `trajectory.json`、episode/debug 产物与结构化日志。
-        作用：聚合输出解析、令牌统计、轨迹转换、日志写入与临时产物清理。
-        """
-
-        """运行后回填 Harbor 上下文并生成兼容产物。
-
-        输入：`AgentContext`（待填充对象）与运行日志目录中的输出文件。
-        输出：更新后的 `context`、可选 `trajectory.json`、episode/debug 产物与结构化日志。
-        作用：聚合输出解析、令牌统计、轨迹转换、日志写入与临时产物清理。
-        """
-
-        output_path = self.logs_dir / self._OUTPUT_FILENAME
-        mode = self._runtime_mode()
-        raw_mode = (self._runtime_env().get("OPENCLAW_OUTPUT_MODE") or "json").strip().lower()
-        output_mode = raw_mode if mode == "cli-backend" else "json"
-
-        session_id: str | None = None
-        model_name = self.model_name or "unknown"
-        parsed: dict[str, Any] = {}
-        trajectory: Trajectory | None = None
-
-        if output_path.exists():
-            raw = output_path.read_text(encoding="utf-8").strip()
-            parsed = self._parse_backend_output(raw, output_mode)
-            usage = parsed.get("usage", {}) if isinstance(parsed.get("usage"), dict) else {}
-
-            context.n_input_tokens = int(usage.get("input") or 0)
-            context.n_output_tokens = int(usage.get("output") or 0)
-            context.n_cache_tokens = int(usage.get("cacheRead") or 0)
-
-            session_id = parsed.get("sessionId") if isinstance(parsed.get("sessionId"), str) else None
-            if session_id:
-                try:
-                    self._state_session_file().parent.mkdir(parents=True, exist_ok=True)
-                    self._state_session_file().write_text(session_id, encoding="utf-8")
-                except OSError:
-                    pass
-
-            model_candidate = parsed.get("model")
-            if isinstance(model_candidate, str) and model_candidate.strip():
-                model_name = model_candidate
-        else:
-            context.n_input_tokens = 0
-            context.n_output_tokens = 0
-            context.n_cache_tokens = 0
-
-        if self.SUPPORTS_ATIF:
-            try:
-                trajectory = self._parse_transcript_to_trajectory(
-                    session_id=session_id or "",
-                    default_model_name=model_name,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"openclaw-v2: ATIF trajectory parsing failed: {exc}")
-                trajectory = None
-
-            if trajectory is not None:
-                trajectory_path = self.logs_dir / "trajectory.json"
-                trajectory_path.write_text(
-                    format_trajectory_json(trajectory.to_json_dict()),
-                    encoding="utf-8",
-                )
-
-        # 尽力输出与官方框架形态对齐的兼容产物。
-        # 尽力输出与官方框架形态对齐的兼容产物。
-        self._emit_official_like_artifacts(parsed=parsed, trajectory=trajectory)
-        self._append_structured_logs(
-            parsed=parsed,
-            trajectory=trajectory,
-            context=context,
-            output_mode=output_mode,
-        )
-        self._cleanup_agent_artifacts()
-
-    def _parse_backend_output(self, raw: str, output_mode: str) -> dict[str, Any]:
-        # 模块：后端输出分发解析
-        # 输入：原始输出文本 + 输出模式
-        # 输出：统一结构字典（text/usage/sessionId/model 等）
-        # 作用：屏蔽 json/jsonl/text 差异，保证后续处理分支稳定。
-        # 模块：后端输出分发解析
-        # 输入：原始输出文本 + 输出模式
-        # 输出：统一结构字典（text/usage/sessionId/model 等）
-        # 作用：屏蔽 json/jsonl/text 差异，保证后续处理分支稳定。
-        if not raw:
-            return {"text": "", "usage": {}, "sessionId": None}
-
-        if output_mode == "jsonl":
-            return self._parse_jsonl_output(raw)
-        if output_mode == "text":
-            return {"text": raw, "usage": {}, "sessionId": None}
-        return self._parse_json_output(raw)
-
-    def _parse_json_output(self, raw: str) -> dict[str, Any]:
-        # 模块：JSON 输出解析
-        # 输入：可能掺杂日志前后缀的原始文本
-        # 输出：统一字段字典；解析失败时退化为纯文本结果
-        # 作用：尽量从非严格输出中恢复有效 JSON，减少运行波动对主流程影响。
-        # 模块：JSON 输出解析
-        # 输入：可能掺杂日志前后缀的原始文本
-        # 输出：统一字段字典；解析失败时退化为纯文本结果
-        # 作用：尽量从非严格输出中恢复有效 JSON，减少运行波动对主流程影响。
-        trimmed = raw.strip()
-        parsed: dict[str, Any] | None = None
-
         try:
-            obj = json.loads(trimmed)
-            if isinstance(obj, dict):
-                parsed = obj
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
-            json_start = trimmed.find("{")
-            json_end = trimmed.rfind("}")
-            if json_start != -1 and json_end > json_start:
-                try:
-                    obj = json.loads(trimmed[json_start : json_end + 1])
-                    if isinstance(obj, dict):
-                        parsed = obj
-                except json.JSONDecodeError:
-                    parsed = None
+            pass
+        return _openclaw_decode_last_json_dict_suffix(text)
 
-        if parsed is None:
-            return {"text": trimmed, "usage": {}, "sessionId": None}
+    def _parse_stdout(self) -> dict[str, Any] | None:
+        output_path = self.logs_dir / "openclaw.txt"
+        if not output_path.exists():
+            return None
+        return self._load_json_object(output_path.read_text())
 
-        usage_raw = self._extract_usage_candidate(parsed)
-        usage = self._extract_usage_map(usage_raw)
-        session_id = self._extract_session_id(parsed)
-        model = self._extract_model_name(parsed)
-        text = self._extract_text(parsed)
-        payload_texts = self._extract_payload_texts(parsed)
-        system_prompt = self._extract_system_prompt_text(parsed)
-        return {
-            "text": text,
-            "usage": usage,
-            "sessionId": session_id,
-            "model": model,
-            "payloads": payload_texts,
-            "systemPrompt": system_prompt,
-        }
+    @staticmethod
+    def _provider_env_prefix(provider: str) -> str:
+        """Convert a provider name to its ``<PROVIDER>_*`` env var prefix."""
+        return provider.upper().replace("-", "_")
 
-    def _extract_system_prompt_text(self, parsed: dict[str, Any]) -> str:
-        meta = parsed.get("meta") if isinstance(parsed.get("meta"), dict) else {}
-        report = (
-            meta.get("systemPromptReport")
-            if isinstance(meta.get("systemPromptReport"), dict)
+    def _model_provider(self) -> str | None:
+        """Return the provider segment of "<provider>/<model>" (or ``None``)."""
+        if not self.model_name or "/" not in self.model_name:
+            return None
+        return self.model_name.split("/", 1)[0]
+
+    def _merge_provider_base_url_from_env(self, cfg: dict[str, Any]) -> None:
+        """Apply "<PROVIDER>_BASE_URL" to "models.providers.<provider>" if not already configured.
+
+        Generic across providers; e.g. "openai/gpt-4.1" reads "OPENAI_BASE_URL".
+        """
+        provider = self._model_provider()
+        if not provider:
+            return
+        env_key = f"{self._provider_env_prefix(provider)}_BASE_URL"
+        base = (self._get_env(env_key) or "").strip()
+        if not base:
+            return
+        models = cfg.setdefault("models", {})
+        providers = models.setdefault("providers", {})
+        prov = providers.setdefault(provider, {})
+        if isinstance(prov, dict) and "baseUrl" not in prov:
+            prov["baseUrl"] = base
+
+    def _normalize_provider_models_schema(self, cfg: dict[str, Any]) -> None:
+        """Align "models.providers.<provider>" with OpenClaw's custom provider schema.
+
+        OpenClaw's OpenAI-compatible custom-provider schema expects a ``models`` array
+        alongside ``baseUrl``. When the user (or env merge) added the provider for the
+        currently selected model but omitted ``models``, fill it from ``--model`` so
+        the agent can resolve the selection.
+        """
+        provider = self._model_provider()
+        if not provider:
+            return
+        models_root = cfg.get("models")
+        if not isinstance(models_root, dict):
+            return
+        providers = models_root.get("providers")
+        if not isinstance(providers, dict):
+            return
+        prov_cfg = providers.get(provider)
+        if not isinstance(prov_cfg, dict):
+            return
+
+        raw_models = prov_cfg.get("models")
+        if not isinstance(raw_models, list):
+            prov_cfg["models"] = []
+
+        if len(prov_cfg["models"]) == 0:
+            prov_cfg["models"] = [{"id": self.model_name, "name": self.model_name}]
+
+    def _build_full_openclaw_config(self) -> dict[str, Any]:
+        """Full "openclaw.json" content: setup baseline + task/job overlays."""
+        cfg = copy.deepcopy(self._SETUP_BASELINE)
+        self._deep_merge(cfg, copy.deepcopy(self._DEFAULT_CONFIG))
+        self._deep_merge(cfg, copy.deepcopy(self._openclaw_config))
+        if self.mcp_servers:
+            servers: dict[str, dict[str, Any]] = {}
+            for server in self.mcp_servers:
+                if server.transport == "stdio":
+                    entry: dict[str, Any] = {}
+                    if server.command:
+                        entry["command"] = server.command
+                    if server.args:
+                        entry["args"] = server.args
+                    servers[server.name] = entry
+                elif server.transport == "sse":
+                    servers[server.name] = {
+                        "url": server.url,
+                        "transport": "sse",
+                    }
+                else:
+                    servers[server.name] = {
+                        "url": server.url,
+                        "transport": "streamable-http",
+                    }
+            mcp_patch = cfg.setdefault("mcp", {})
+            existing = mcp_patch.get("servers")
+            merged_servers: dict[str, Any] = (
+                dict(existing) if isinstance(existing, dict) else {}
+            )
+            merged_servers.update(servers)
+            mcp_patch["servers"] = merged_servers
+
+        self._merge_provider_base_url_from_env(cfg)
+        self._normalize_provider_models_schema(cfg)
+        self._merge_harbor_headless_tool_denies(cfg)
+
+        if self._failover_retries is not None:
+            auth = cfg.setdefault("auth", {})
+            cooldowns = auth.setdefault("cooldowns", {})
+            cooldowns["rateLimitedProfileRotations"] = self._failover_retries
+
+        return cfg
+
+    def _trajectory_from_envelope_with_steps(
+        self, envelope: dict[str, Any], steps: list[Step]
+    ) -> Trajectory | None:
+        """ATIF shell from CLI envelope meta + caller-supplied steps (e.g. session JSONL)."""
+        meta = envelope.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        agent_meta = meta.get("agentMeta")
+        session_id = (
+            agent_meta.get("sessionId")
+            if isinstance(agent_meta, dict)
+            and isinstance(agent_meta.get("sessionId"), str)
             else None
+        ) or "unknown"
+        usage_fm: dict[str, Any] | None = None
+        if isinstance(agent_meta, dict):
+            u2 = agent_meta.get("usage")
+            if isinstance(u2, dict):
+                usage_fm = u2
+        input_tok_fm = int(usage_fm.get("input") or 0) if usage_fm else 0
+        output_tok_fm = int(usage_fm.get("output") or 0) if usage_fm else 0
+        cache_read_fm = int(usage_fm.get("cacheRead") or 0) if usage_fm else 0
+        prompt_fm = input_tok_fm + cache_read_fm
+        final_metrics = FinalMetrics(
+            total_prompt_tokens=prompt_fm or None,
+            total_completion_tokens=output_tok_fm or None,
+            total_cached_tokens=cache_read_fm or None,
+            total_steps=len(steps),
         )
-        if report is None:
-            return ""
-        text = report.get("systemPrompt")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        # 当未返回完整 system prompt 文本时，保留紧凑 report 便于排查。
-        # 当未返回完整 system prompt 文本时，保留紧凑 report 便于排查。
-        return json.dumps(report, ensure_ascii=False)
-
-    def _parse_jsonl_output(self, raw: str) -> dict[str, Any]:
-        # 模块：JSONL 输出解析
-        # 输入：逐行 JSON 事件文本
-        # 输出：聚合后的 text/usage/sessionId/model
-        # 作用：面向流式输出场景，逐行容错并累加 usage。
-        # 模块：JSONL 输出解析
-        # 输入：逐行 JSON 事件文本
-        # 输出：聚合后的 text/usage/sessionId/model
-        # 作用：面向流式输出场景，逐行容错并累加 usage。
-        lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        text_parts: list[str] = []
-        usage: dict[str, int] = {}
-        session_id: str | None = None
-        model: str | None = None
-
-        for line in lines:
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-
-            if not session_id:
-                session_id = self._extract_session_id(obj)
-            if not model:
-                model = self._extract_model_name(obj)
-
-            candidate_usage = self._extract_usage_map(self._extract_usage_candidate(obj))
-            usage = self._merge_usage(usage, candidate_usage)
-
-            text = self._extract_text(obj)
-            if text:
-                text_parts.append(text)
-
-        return {
-            "text": "\n".join(part for part in text_parts if part).strip(),
-            "usage": usage,
-            "sessionId": session_id,
-            "model": model,
-        }
-
-    def _extract_usage_candidate(self, parsed: dict[str, Any]) -> dict[str, Any]:
-        meta = parsed.get("meta") if isinstance(parsed.get("meta"), dict) else {}
-        agent_meta = meta.get("agentMeta") if isinstance(meta.get("agentMeta"), dict) else {}
-        usage = agent_meta.get("usage") if isinstance(agent_meta.get("usage"), dict) else None
-        if usage is None and isinstance(parsed.get("usage"), dict):
-            usage = parsed.get("usage")
-        return usage if isinstance(usage, dict) else {}
-
-    def _extract_usage_map(self, usage: dict[str, Any]) -> dict[str, int]:
-        def pick(keys: list[str]) -> int:
-            for key in keys:
-                value = usage.get(key)
-                if isinstance(value, (int, float)):
-                    return int(value)
-            return 0
-
-        return {
-            "input": pick(["input", "input_tokens", "inputTokens"]),
-            "output": pick(["output", "output_tokens", "outputTokens"]),
-            "cacheRead": pick(["cacheRead", "cache_read_input_tokens", "cached_input_tokens"]),
-            "cacheWrite": pick(["cacheWrite", "cache_write_input_tokens"]),
-            "total": pick(["total", "total_tokens", "totalTokens"]),
-        }
-
-    def _merge_usage(self, base: dict[str, int], add: dict[str, int]) -> dict[str, int]:
-        merged = dict(base)
-        for key, value in add.items():
-            merged[key] = merged.get(key, 0) + int(value)
-        return merged
-
-    def _extract_session_id(self, parsed: dict[str, Any]) -> str | None:
-        # 模块：会话 ID 提取
-        # 输入：单条解析后的响应对象
-        # 输出：session id（若不存在则返回 None）
-        # 作用：兼容多种字段命名与嵌套结构，降低后端协议差异影响。
-        # 模块：会话 ID 提取
-        # 输入：单条解析后的响应对象
-        # 输出：session id（若不存在则返回 None）
-        # 作用：兼容多种字段命名与嵌套结构，降低后端协议差异影响。
-        fields_raw = (
-            self._runtime_env().get("OPENCLAW_SESSION_ID_FIELDS")
-            or "session_id,sessionId,conversation_id,conversationId,thread_id"
+        return Trajectory(
+            schema_version="ATIF-v1.7",
+            session_id=session_id,
+            agent=Agent(
+                name="openclaw",
+                version=self.version() or "unknown",
+                model_name=self.model_name,
+            ),
+            steps=steps,
+            final_metrics=final_metrics,
         )
-        fields = [part.strip() for part in fields_raw.split(",") if part.strip()]
 
-        for field in fields:
-            value = parsed.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+    def _convert_envelope_to_trajectory(
+        self, envelope: dict[str, Any], instruction: str
+    ) -> Trajectory | None:
+        """Map OpenClaw CLI JSON (embedded "--local" run) to ATIF."""
+        meta = envelope.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
 
-        session = parsed.get("session")
-        if isinstance(session, dict):
-            sid = session.get("id")
-            if isinstance(sid, str) and sid.strip():
-                return sid.strip()
+        agent_meta = meta.get("agentMeta")
+        session_id = (
+            agent_meta.get("sessionId")
+            if isinstance(agent_meta, dict)
+            and isinstance(agent_meta.get("sessionId"), str)
+            else None
+        ) or "unknown"
 
-        meta = parsed.get("meta")
-        if isinstance(meta, dict):
-            agent_meta = meta.get("agentMeta")
-            if isinstance(agent_meta, dict):
-                sid = agent_meta.get("sessionId")
-                if isinstance(sid, str) and sid.strip():
-                    return sid.strip()
-
-        return None
-
-    def _extract_model_name(self, parsed: dict[str, Any]) -> str | None:
-        # 模块：模型名提取
-        # 输入：单条解析后的响应对象
-        # 输出：模型名字符串或 None
-        # 作用：按优先级在顶层/session/meta 中提取模型名。
-        value = parsed.get("model")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        # 模块：模型名提取
-        # 输入：单条解析后的响应对象
-        # 输出：模型名字符串或 None
-        # 作用：按优先级在顶层/session/meta 中提取模型名。
-        value = parsed.get("model")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-        session = parsed.get("session")
-        if isinstance(session, dict):
-            value = session.get("model")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-        meta = parsed.get("meta")
-        if isinstance(meta, dict):
-            agent_meta = meta.get("agentMeta")
-            if isinstance(agent_meta, dict):
-                value = agent_meta.get("model")
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-
-        return None
-
-    def _extract_text(self, parsed: dict[str, Any]) -> str:
-        def collect(value: Any) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, str):
-                return value
-            if isinstance(value, list):
-                return "".join(collect(item) for item in value)
-            if isinstance(value, dict):
-                if isinstance(value.get("text"), str):
-                    return value["text"]
-                if isinstance(value.get("content"), str):
-                    return value["content"]
-                if isinstance(value.get("content"), list):
-                    return "".join(collect(item) for item in value["content"])
-                if isinstance(value.get("message"), dict):
-                    return collect(value["message"])
-            return ""
-
-        return (
-            collect(parsed.get("message"))
-            or collect(parsed.get("content"))
-            or collect(parsed.get("result"))
-            or ""
-        ).strip()
-
-    def _extract_payload_texts(self, parsed: dict[str, Any]) -> list[str]:
-        payloads = parsed.get("payloads")
+        payloads = envelope.get("payloads")
         if not isinstance(payloads, list):
-            return []
-        out: list[str] = []
+            payloads = []
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         for item in payloads:
             if not isinstance(item, dict):
                 continue
-            text = item.get("text")
-            if isinstance(text, str) and text.strip():
-                out.append(text.strip())
-        return out
-
-    def _load_plugin_tool_index(self) -> dict[str, list[dict[str, str]]]:
-        """加载工具名到插件信息的映射索引。
-
-        输入：`openclaw-plugins.json`（由 `openclaw plugins inspect --all --json` 生成）。
-        输出：`{tool_name_lower: [plugin_info, ...]}`。
-        作用：将插件加载/注册信息并入工具调用记录，提升实验可解释性。
-        """
-
-        plugin_path = self.logs_dir / _PLUGIN_INSPECT_FILENAME
-        if not plugin_path.exists() or not plugin_path.is_file():
-            return {}
-
-        try:
-            raw = plugin_path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-
-        entries: list[dict[str, Any]] = []
-        if isinstance(parsed, list):
-            entries = [entry for entry in parsed if isinstance(entry, dict)]
-        elif isinstance(parsed, dict):
-            plugins = parsed.get("plugins")
-            if isinstance(plugins, list):
-                entries = [entry for entry in plugins if isinstance(entry, dict)]
-
-        index: dict[str, list[dict[str, str]]] = {}
-
-        def register_tool(tool_name: str, plugin_info: dict[str, str]) -> None:
-            normalized = tool_name.strip().lower()
-            if not normalized:
-                return
-            bucket = index.setdefault(normalized, [])
-            plugin_id = plugin_info.get("plugin_id", "")
-            if plugin_id and any(existing.get("plugin_id") == plugin_id for existing in bucket):
-                return
-            bucket.append(plugin_info)
-
-        for entry in entries:
-            plugin = entry.get("plugin") if isinstance(entry.get("plugin"), dict) else entry
-            plugin_id = str(plugin.get("id") or "").strip() if isinstance(plugin, dict) else ""
-            if not plugin_id:
+            t = item.get("text")
+            if not isinstance(t, str) or not t.strip():
                 continue
-
-            plugin_info = {
-                "plugin_id": plugin_id,
-                "plugin_name": str(plugin.get("name") or plugin_id).strip(),
-                "origin": str(plugin.get("origin") or "").strip(),
-                "source": str(plugin.get("source") or "").strip(),
-            }
-
-            inspect_tools = entry.get("tools")
-            if isinstance(inspect_tools, list):
-                for tool in inspect_tools:
-                    if not isinstance(tool, dict):
-                        continue
-                    names = tool.get("names")
-                    if not isinstance(names, list):
-                        continue
-                    for name in names:
-                        if isinstance(name, str):
-                            register_tool(name, plugin_info)
-
-            tool_names = entry.get("toolNames")
-            if isinstance(tool_names, list):
-                for name in tool_names:
-                    if isinstance(name, str):
-                        register_tool(name, plugin_info)
-
-        return index
-
-    def _lookup_plugin_candidates(
-        self,
-        tool_name: str,
-        plugin_tool_index: dict[str, list[dict[str, str]]],
-    ) -> list[dict[str, str]]:
-        normalized = (tool_name or "").strip().lower()
-        if not normalized:
-            return []
-
-        direct = plugin_tool_index.get(normalized)
-        if direct:
-            return [dict(item) for item in direct]
-
-        # 兼容带命名空间的工具名（如 plugin/tool）。
-        suffix = normalized.split("/", 1)[-1]
-        if suffix and suffix != normalized:
-            matched = plugin_tool_index.get(suffix)
-            if matched:
-                return [dict(item) for item in matched]
-
-        namespace_matches: list[dict[str, str]] = []
-        for candidate_name, items in plugin_tool_index.items():
-            if candidate_name.endswith(f"/{normalized}"):
-                namespace_matches.extend(dict(item) for item in items)
-
-        dedup: dict[str, dict[str, str]] = {}
-        for item in namespace_matches:
-            key = item.get("plugin_id") or json.dumps(item, ensure_ascii=False)
-            dedup[key] = item
-        return list(dedup.values())
-
-    def _build_tool_call_records(
-        self,
-        tool_calls: list[ToolCall] | None,
-        plugin_tool_index: dict[str, list[dict[str, str]]],
-    ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for call in tool_calls or []:
-            name = call.function_name or ""
-            records.append(
-                {
-                    "id": call.tool_call_id,
-                    "name": name,
-                    "arguments": call.arguments,
-                    "plugin_candidates": self._lookup_plugin_candidates(name, plugin_tool_index),
-                }
-            )
-        return records
-
-    def _build_tool_result_records(
-        self,
-        observation: Observation | None,
-        tool_call_records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        call_name_by_id: dict[str, str] = {}
-        for record in tool_call_records:
-            call_id = record.get("id")
-            call_name = record.get("name")
-            if isinstance(call_id, str) and call_id and isinstance(call_name, str):
-                call_name_by_id[call_id] = call_name
-
-        out: list[dict[str, Any]] = []
-        for result in (observation.results if observation and observation.results else []):
-            source_call_id = result.source_call_id if isinstance(result.source_call_id, str) else None
-            out.append(
-                {
-                    "source_call_id": source_call_id,
-                    "tool_name": call_name_by_id.get(source_call_id or "") if source_call_id else None,
-                    "content": result.content,
-                }
-            )
-        return out
-
-    def _render_tool_details_text(
-        self,
-        tool_call_records: list[dict[str, Any]],
-        tool_result_records: list[dict[str, Any]],
-    ) -> str:
-        lines: list[str] = []
-
-        if tool_call_records:
-            lines.append("【工具调用详情】")
-            for idx, call in enumerate(tool_call_records, start=1):
-                name = str(call.get("name") or "") or "(unknown)"
-                call_id = str(call.get("id") or "") or "-"
-                lines.append(f"{idx}. name={name} call_id={call_id}")
-                lines.append(
-                    f"   arguments={json.dumps(call.get('arguments', {}), ensure_ascii=False)}"
-                )
-
-                candidates = call.get("plugin_candidates")
-                if isinstance(candidates, list) and candidates:
-                    rendered = []
-                    for item in candidates:
-                        if not isinstance(item, dict):
-                            continue
-                        plugin_id = str(item.get("plugin_id") or "").strip()
-                        plugin_name = str(item.get("plugin_name") or plugin_id).strip()
-                        origin = str(item.get("origin") or "").strip()
-                        source = str(item.get("source") or "").strip()
-                        base = plugin_name if plugin_name else plugin_id
-                        extras = [part for part in [plugin_id, origin, source] if part]
-                        rendered.append(f"{base} ({', '.join(extras)})" if extras else base)
-                    if rendered:
-                        lines.append(f"   plugin_candidates={'; '.join(rendered)}")
-
-        if tool_result_records:
-            if lines:
-                lines.append("")
-            lines.append("【工具调用结果】")
-            for idx, result in enumerate(tool_result_records, start=1):
-                call_id = str(result.get("source_call_id") or "") or "-"
-                tool_name = str(result.get("tool_name") or "") or "(unknown)"
-                content = result.get("content")
-                content_text = "" if content is None else str(content)
-                lines.append(f"{idx}. tool={tool_name} source_call_id={call_id}")
-                lines.append(f"   content={content_text}")
-
-        return "\n".join(lines).strip()
-
-    def _load_plugin_tool_index(self) -> dict[str, list[dict[str, str]]]:
-        """加载工具名到插件信息的映射索引。
-
-        输入：`openclaw-plugins.json`（由 `openclaw plugins inspect --all --json` 生成）。
-        输出：`{tool_name_lower: [plugin_info, ...]}`。
-        作用：将插件加载/注册信息并入工具调用记录，提升实验可解释性。
-        """
-
-        plugin_path = self.logs_dir / _PLUGIN_INSPECT_FILENAME
-        if not plugin_path.exists() or not plugin_path.is_file():
-            return {}
-
-        try:
-            raw = plugin_path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-
-        entries: list[dict[str, Any]] = []
-        if isinstance(parsed, list):
-            entries = [entry for entry in parsed if isinstance(entry, dict)]
-        elif isinstance(parsed, dict):
-            plugins = parsed.get("plugins")
-            if isinstance(plugins, list):
-                entries = [entry for entry in plugins if isinstance(entry, dict)]
-
-        index: dict[str, list[dict[str, str]]] = {}
-
-        def register_tool(tool_name: str, plugin_info: dict[str, str]) -> None:
-            normalized = tool_name.strip().lower()
-            if not normalized:
-                return
-            bucket = index.setdefault(normalized, [])
-            plugin_id = plugin_info.get("plugin_id", "")
-            if plugin_id and any(existing.get("plugin_id") == plugin_id for existing in bucket):
-                return
-            bucket.append(plugin_info)
-
-        for entry in entries:
-            plugin = entry.get("plugin") if isinstance(entry.get("plugin"), dict) else entry
-            plugin_id = str(plugin.get("id") or "").strip() if isinstance(plugin, dict) else ""
-            if not plugin_id:
-                continue
-
-            plugin_info = {
-                "plugin_id": plugin_id,
-                "plugin_name": str(plugin.get("name") or plugin_id).strip(),
-                "origin": str(plugin.get("origin") or "").strip(),
-                "source": str(plugin.get("source") or "").strip(),
-            }
-
-            inspect_tools = entry.get("tools")
-            if isinstance(inspect_tools, list):
-                for tool in inspect_tools:
-                    if not isinstance(tool, dict):
-                        continue
-                    names = tool.get("names")
-                    if not isinstance(names, list):
-                        continue
-                    for name in names:
-                        if isinstance(name, str):
-                            register_tool(name, plugin_info)
-
-            tool_names = entry.get("toolNames")
-            if isinstance(tool_names, list):
-                for name in tool_names:
-                    if isinstance(name, str):
-                        register_tool(name, plugin_info)
-
-        return index
-
-    def _lookup_plugin_candidates(
-        self,
-        tool_name: str,
-        plugin_tool_index: dict[str, list[dict[str, str]]],
-    ) -> list[dict[str, str]]:
-        normalized = (tool_name or "").strip().lower()
-        if not normalized:
-            return []
-
-        direct = plugin_tool_index.get(normalized)
-        if direct:
-            return [dict(item) for item in direct]
-
-        # 兼容带命名空间的工具名（如 plugin/tool）。
-        suffix = normalized.split("/", 1)[-1]
-        if suffix and suffix != normalized:
-            matched = plugin_tool_index.get(suffix)
-            if matched:
-                return [dict(item) for item in matched]
-
-        namespace_matches: list[dict[str, str]] = []
-        for candidate_name, items in plugin_tool_index.items():
-            if candidate_name.endswith(f"/{normalized}"):
-                namespace_matches.extend(dict(item) for item in items)
-
-        dedup: dict[str, dict[str, str]] = {}
-        for item in namespace_matches:
-            key = item.get("plugin_id") or json.dumps(item, ensure_ascii=False)
-            dedup[key] = item
-        return list(dedup.values())
-
-    def _build_tool_call_records(
-        self,
-        tool_calls: list[ToolCall] | None,
-        plugin_tool_index: dict[str, list[dict[str, str]]],
-    ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for call in tool_calls or []:
-            name = call.function_name or ""
-            records.append(
-                {
-                    "id": call.tool_call_id,
-                    "name": name,
-                    "arguments": call.arguments,
-                    "plugin_candidates": self._lookup_plugin_candidates(name, plugin_tool_index),
-                }
-            )
-        return records
-
-    def _build_tool_result_records(
-        self,
-        observation: Observation | None,
-        tool_call_records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        call_name_by_id: dict[str, str] = {}
-        for record in tool_call_records:
-            call_id = record.get("id")
-            call_name = record.get("name")
-            if isinstance(call_id, str) and call_id and isinstance(call_name, str):
-                call_name_by_id[call_id] = call_name
-
-        out: list[dict[str, Any]] = []
-        for result in (observation.results if observation and observation.results else []):
-            source_call_id = result.source_call_id if isinstance(result.source_call_id, str) else None
-            out.append(
-                {
-                    "source_call_id": source_call_id,
-                    "tool_name": call_name_by_id.get(source_call_id or "") if source_call_id else None,
-                    "content": result.content,
-                }
-            )
-        return out
-
-    def _render_tool_details_text(
-        self,
-        tool_call_records: list[dict[str, Any]],
-        tool_result_records: list[dict[str, Any]],
-    ) -> str:
-        lines: list[str] = []
-
-        if tool_call_records:
-            lines.append("【工具调用详情】")
-            for idx, call in enumerate(tool_call_records, start=1):
-                name = str(call.get("name") or "") or "(unknown)"
-                call_id = str(call.get("id") or "") or "-"
-                lines.append(f"{idx}. name={name} call_id={call_id}")
-                lines.append(
-                    f"   arguments={json.dumps(call.get('arguments', {}), ensure_ascii=False)}"
-                )
-
-                candidates = call.get("plugin_candidates")
-                if isinstance(candidates, list) and candidates:
-                    rendered = []
-                    for item in candidates:
-                        if not isinstance(item, dict):
-                            continue
-                        plugin_id = str(item.get("plugin_id") or "").strip()
-                        plugin_name = str(item.get("plugin_name") or plugin_id).strip()
-                        origin = str(item.get("origin") or "").strip()
-                        source = str(item.get("source") or "").strip()
-                        base = plugin_name if plugin_name else plugin_id
-                        extras = [part for part in [plugin_id, origin, source] if part]
-                        rendered.append(f"{base} ({', '.join(extras)})" if extras else base)
-                    if rendered:
-                        lines.append(f"   plugin_candidates={'; '.join(rendered)}")
-
-        if tool_result_records:
-            if lines:
-                lines.append("")
-            lines.append("【工具调用结果】")
-            for idx, result in enumerate(tool_result_records, start=1):
-                call_id = str(result.get("source_call_id") or "") or "-"
-                tool_name = str(result.get("tool_name") or "") or "(unknown)"
-                content = result.get("content")
-                content_text = "" if content is None else str(content)
-                lines.append(f"{idx}. tool={tool_name} source_call_id={call_id}")
-                lines.append(f"   content={content_text}")
-
-        return "\n".join(lines).strip()
-
-    def _emit_official_like_artifacts(
-        self,
-        parsed: dict[str, Any],
-        trajectory: Trajectory | None,
-    ) -> None:
-        # 模块：官方风格产物输出
-        # 输入：解析结果与轨迹对象
-        # 输出：episode-*/prompt.txt、response.txt、debug.json
-        # 作用：提供与 Harbor 既有可视化/分析链路对齐的结果目录结构。
-        try:
-            plugin_tool_index = self._load_plugin_tool_index()
-            episodes = self._build_episode_pairs(
-                parsed=parsed,
-                trajectory=trajectory,
-                plugin_tool_index=plugin_tool_index,
-            )
-        # 模块：官方风格产物输出
-        # 输入：解析结果与轨迹对象
-        # 输出：episode-*/prompt.txt、response.txt、debug.json
-        # 作用：提供与 Harbor 既有可视化/分析链路对齐的结果目录结构。
-        try:
-            plugin_tool_index = self._load_plugin_tool_index()
-            episodes = self._build_episode_pairs(
-                parsed=parsed,
-                trajectory=trajectory,
-                plugin_tool_index=plugin_tool_index,
-            )
-            for idx, episode in enumerate(episodes):
-                ep_dir = self.logs_dir / f"episode-{idx}"
-                ep_dir.mkdir(parents=True, exist_ok=True)
-                (ep_dir / "prompt.txt").write_text(episode.get("prompt", ""), encoding="utf-8")
-                (ep_dir / "response.txt").write_text(episode.get("response", ""), encoding="utf-8")
-                (ep_dir / "raw.json").write_text(
-                    json.dumps(episode.get("raw", {}), ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                (ep_dir / "raw.json").write_text(
-                    json.dumps(episode.get("raw", {}), ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                (ep_dir / "debug.json").write_text(
-                    json.dumps(episode.get("debug", {}), ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-        except Exception as exc:  # noqa: BLE001
-            self._append_job_log(f"openclaw: emit_official_like_artifacts failed: {exc}")
-
-    def _build_episode_pairs(
-        self,
-        parsed: dict[str, Any],
-        trajectory: Trajectory | None,
-        plugin_tool_index: dict[str, list[dict[str, str]]] | None = None,
-        plugin_tool_index: dict[str, list[dict[str, str]]] | None = None,
-    ) -> list[dict[str, Any]]:
-        episodes: list[dict[str, Any]] = []
-        tool_index = plugin_tool_index or {}
-        tool_index = plugin_tool_index or {}
-
-        if trajectory is not None:
-            # 让 episode 数量与轨迹 step 数量对齐，便于对照调试。
-            # 让 episode 数量与轨迹 step 数量对齐，便于对照调试。
-            last_prompt = ""
-            system_prompt = (
-                parsed.get("systemPrompt") if isinstance(parsed.get("systemPrompt"), str) else ""
-            )
-            episode_index = 0
-            for step in trajectory.steps:
-                if step.source in ("user", "system"):
-                    prompt = step.message or system_prompt or ""
-                    if prompt:
-                        last_prompt = prompt
-                    episodes.append(
-                        {
-                            "prompt": prompt,
-                            "response": "",
-                            "raw": {
-                                "prompt_raw": prompt,
-                                "response_raw": "",
-                                "source": step.source,
-                                "step_id": step.step_id,
-                                "timestamp": step.timestamp,
-                            },
-                            "raw": {
-                                "prompt_raw": prompt,
-                                "response_raw": "",
-                                "source": step.source,
-                                "step_id": step.step_id,
-                                "timestamp": step.timestamp,
-                            },
-                            "debug": {
-                                "episode": episode_index,
-                                "source": f"trajectory-{step.source}-step",
-                                "step_id": step.step_id,
-                                "timestamp": step.timestamp,
-                                "message_chars": len(step.message or ""),
-                            },
-                        }
-                    )
-                    episode_index += 1
-                    continue
-
-                if step.source == "agent":
-                    prompt = last_prompt or system_prompt or ""
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, tool_index)
-                    tool_result_records = self._build_tool_result_records(step.observation, tool_call_records)
-                    tool_details_text = self._render_tool_details_text(
-                        tool_call_records,
-                        tool_result_records,
-                    )
-                    response_text = step.message or ""
-                    if tool_details_text:
-                        response_text = (
-                            f"{response_text}\n\n{tool_details_text}"
-                            if response_text
-                            else tool_details_text
-                        )
-
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, tool_index)
-                    tool_result_records = self._build_tool_result_records(step.observation, tool_call_records)
-                    tool_details_text = self._render_tool_details_text(
-                        tool_call_records,
-                        tool_result_records,
-                    )
-                    response_text = step.message or ""
-                    if tool_details_text:
-                        response_text = (
-                            f"{response_text}\n\n{tool_details_text}"
-                            if response_text
-                            else tool_details_text
-                        )
-
-                    debug_obj = {
-                        "episode": episode_index,
-                        "source": "trajectory-agent-step",
-                        "step_id": step.step_id,
-                        "model": step.model_name,
-                        "timestamp": step.timestamp,
-                        "message_chars": len(step.message or ""),
-                        "tool_call_count": len(step.tool_calls or []),
-                    }
-                    if step.metrics is not None:
-                        debug_obj["metrics"] = {
-                            "prompt_tokens": step.metrics.prompt_tokens,
-                            "completion_tokens": step.metrics.completion_tokens,
-                            "cached_tokens": step.metrics.cached_tokens,
-                            "cost_usd": step.metrics.cost_usd,
-                        }
-                    if tool_call_records:
-                        debug_obj["tool_calls"] = tool_call_records
-                    if tool_result_records:
-                        debug_obj["tool_results"] = tool_result_records
-                    if tool_call_records:
-                        debug_obj["tool_calls"] = tool_call_records
-                    if tool_result_records:
-                        debug_obj["tool_results"] = tool_result_records
-
-                    episodes.append(
-                        {
-                            "prompt": prompt,
-                            "response": response_text,
-                            "raw": {
-                                "prompt_raw": prompt,
-                                "response_raw": step.message or "",
-                                "response_with_tool_details": response_text,
-                                "model": step.model_name,
-                                "step_id": step.step_id,
-                                "timestamp": step.timestamp,
-                                "tool_calls": tool_call_records,
-                                "tool_results": tool_result_records,
-                                "token_usage": {
-                                    "prompt_tokens": step.metrics.prompt_tokens if step.metrics else None,
-                                    "completion_tokens": step.metrics.completion_tokens if step.metrics else None,
-                                    "cached_tokens": step.metrics.cached_tokens if step.metrics else None,
-                                    "cost_usd": step.metrics.cost_usd if step.metrics else None,
-                                },
-                            },
-                            "response": response_text,
-                            "raw": {
-                                "prompt_raw": prompt,
-                                "response_raw": step.message or "",
-                                "response_with_tool_details": response_text,
-                                "model": step.model_name,
-                                "step_id": step.step_id,
-                                "timestamp": step.timestamp,
-                                "tool_calls": tool_call_records,
-                                "tool_results": tool_result_records,
-                                "token_usage": {
-                                    "prompt_tokens": step.metrics.prompt_tokens if step.metrics else None,
-                                    "completion_tokens": step.metrics.completion_tokens if step.metrics else None,
-                                    "cached_tokens": step.metrics.cached_tokens if step.metrics else None,
-                                    "cost_usd": step.metrics.cost_usd if step.metrics else None,
-                                },
-                            },
-                            "debug": debug_obj,
-                        }
-                    )
-                    episode_index += 1
-                    continue
-
-                episodes.append(
-                    {
-                        "prompt": last_prompt or system_prompt or "",
-                        "response": step.message or "",
-                        "raw": {
-                            "prompt_raw": last_prompt or system_prompt or "",
-                            "response_raw": step.message or "",
-                            "source": step.source,
-                            "step_id": step.step_id,
-                            "timestamp": step.timestamp,
-                        },
-                        "raw": {
-                            "prompt_raw": last_prompt or system_prompt or "",
-                            "response_raw": step.message or "",
-                            "source": step.source,
-                            "step_id": step.step_id,
-                            "timestamp": step.timestamp,
-                        },
-                        "debug": {
-                            "episode": episode_index,
-                            "source": f"trajectory-{step.source}-step",
-                            "step_id": step.step_id,
-                            "timestamp": step.timestamp,
-                            "message_chars": len(step.message or ""),
-                        },
-                    }
-                )
-                episode_index += 1
-
-        if not episodes:
-            payloads = parsed.get("payloads")
-            if isinstance(payloads, list) and payloads:
-                for idx, text in enumerate(payloads):
-                    if not isinstance(text, str):
-                        continue
-                    episodes.append(
-                        {
-                            "prompt": "",
-                            "response": text,
-                            "raw": {
-                                "prompt_raw": "",
-                                "response_raw": text,
-                                "source": "payloads",
-                                "index": idx,
-                            },
-                            "raw": {
-                                "prompt_raw": "",
-                                "response_raw": text,
-                                "source": "payloads",
-                                "index": idx,
-                            },
-                            "debug": {
-                                "source": "payloads",
-                                "index": idx,
-                            },
-                        }
-                    )
-
-        if not episodes:
-            episodes.append(
-                {
-                    "prompt": "",
-                    "response": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
-                    "raw": {
-                        "prompt_raw": "",
-                        "response_raw": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
-                        "source": "fallback",
-                    },
-                    "raw": {
-                        "prompt_raw": "",
-                        "response_raw": parsed.get("text", "") if isinstance(parsed.get("text"), str) else "",
-                        "source": "fallback",
-                    },
-                    "debug": {"source": "fallback"},
-                }
-            )
-
-        return episodes
-
-    def _append_job_log(self, message: str) -> None:
-        try:
-            trial_dir = self.logs_dir.parent
-            trial_log = trial_dir / "trial.log"
-            job_log = trial_dir.parent / "job.log"
-            line = f"{datetime.now(timezone.utc).isoformat()} {message}\n"
-            trial_log.parent.mkdir(parents=True, exist_ok=True)
-            with trial_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-            with job_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-        except OSError:
-            pass
-
-    def _append_structured_logs(
-        self,
-        parsed: dict[str, Any],
-        trajectory: Trajectory | None,
-        context: AgentContext,
-        output_mode: str,
-    ) -> None:
-        # 模块：结构化日志汇总
-        # 输入：解析结果、轨迹、上下文计数与输出模式
-        # 输出：job.log/trial.log 的摘要与逐轮日志
-        # 作用：把关键诊断信息收敛到统一日志，便于问题回放与对比。
-        # 模块：结构化日志汇总
-        # 输入：解析结果、轨迹、上下文计数与输出模式
-        # 输出：job.log/trial.log 的摘要与逐轮日志
-        # 作用：把关键诊断信息收敛到统一日志，便于问题回放与对比。
-        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
-        payloads = parsed.get("payloads") if isinstance(parsed.get("payloads"), list) else []
-        text = parsed.get("text") if isinstance(parsed.get("text"), str) else ""
-        session_id = parsed.get("sessionId") if isinstance(parsed.get("sessionId"), str) else ""
-        model = parsed.get("model") if isinstance(parsed.get("model"), str) else (self.model_name or "")
-        step_count = len(trajectory.steps) if trajectory is not None else 0
-        plugin_tool_index = self._load_plugin_tool_index()
-        plugin_tool_index = self._load_plugin_tool_index()
-
-        stderr_path = self.logs_dir / "openclaw-stderr.txt"
-        stderr_lines: list[str] = []
-        if stderr_path.exists():
-            try:
-                stderr_lines = [ln.strip() for ln in stderr_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            except OSError:
-                stderr_lines = []
-
-        self._append_job_log("openclaw: run summary begin")
-        self._append_job_log(f"openclaw: output_mode={output_mode} session_id={session_id or '-'} model={model or '-'}")
-        self._append_job_log(
-            "openclaw: tokens "
-            f"input={context.n_input_tokens} output={context.n_output_tokens} cache={context.n_cache_tokens} "
-            f"usage_total={usage.get('total', 0) if isinstance(usage, dict) else 0}"
-        )
-        self._append_job_log(
-            f"openclaw: payloads={len(payloads)} text_chars={len(text)} trajectory_steps={step_count}"
-        )
-        self._append_job_log(f"openclaw: plugin_tool_index_size={len(plugin_tool_index)}")
-        self._append_job_log(f"openclaw: plugin_tool_index_size={len(plugin_tool_index)}")
-        system_prompt = parsed.get("systemPrompt") if isinstance(parsed.get("systemPrompt"), str) else ""
-        if system_prompt:
-            self._append_job_log(f"openclaw: system_prompt={json.dumps(system_prompt, ensure_ascii=False)}")
-
-        if trajectory is not None:
-            last_prompt = system_prompt
-            turn = 0
-            for step in trajectory.steps:
-                if step.source in ("user", "system"):
-                    if step.message:
-                        last_prompt = step.message
-                    if step.source == "system" and step.message:
-                        self._append_job_log(
-                            f"openclaw: system_step[{step.step_id}]={json.dumps(step.message, ensure_ascii=False)}"
-                        )
-                    continue
-
-                if step.source != "agent":
-                    continue
-
-                turn += 1
-                self._append_job_log(
-                    f"openclaw: turn[{turn}] prompt={json.dumps(last_prompt or '', ensure_ascii=False)}"
-                )
-                self._append_job_log(
-                    f"openclaw: turn[{turn}] response={json.dumps(step.message or '', ensure_ascii=False)}"
-                )
-                if step.tool_calls:
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
-                    self._append_job_log(
-                        "openclaw: turn[{}] tool_calls={}".format(
-                            turn,
-                            json.dumps(tool_call_records, ensure_ascii=False),
-                            json.dumps(tool_call_records, ensure_ascii=False),
-                        )
-                    )
-                if step.observation and step.observation.results:
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
-                    tool_result_records = self._build_tool_result_records(
-                        step.observation,
-                        tool_call_records,
-                    )
-                    tool_call_records = self._build_tool_call_records(step.tool_calls, plugin_tool_index)
-                    tool_result_records = self._build_tool_result_records(
-                        step.observation,
-                        tool_call_records,
-                    )
-                    self._append_job_log(
-                        "openclaw: turn[{}] tool_results={}".format(
-                            turn,
-                            json.dumps(tool_result_records, ensure_ascii=False),
-                            json.dumps(tool_result_records, ensure_ascii=False),
-                        )
-                    )
-
-        if stderr_lines:
-            self._append_job_log(f"openclaw: stderr_lines={len(stderr_lines)}")
-            for idx, line in enumerate(stderr_lines[:10], start=1):
-                self._append_job_log(f"openclaw: stderr[{idx}] {line}")
-        self._append_job_log("openclaw: run summary end")
-
-    def _cleanup_agent_artifacts(self) -> None:
-        # 模块：运行后清理
-        # 输入：logs 目录中的临时执行产物
-        # 输出：删除不需要暴露给上层的中间文件/目录
-        # 作用：保持输出目录稳定、简洁，并与官方结果布局保持一致。
-        # 为保持与官方布局一致，清理不对上层暴露的低层执行中间产物。
-        # 模块：运行后清理
-        # 输入：logs 目录中的临时执行产物
-        # 输出：删除不需要暴露给上层的中间文件/目录
-        # 作用：保持输出目录稳定、简洁，并与官方结果布局保持一致。
-        # 为保持与官方布局一致，清理不对上层暴露的低层执行中间产物。
-        for path in sorted(self.logs_dir.glob("command-*")):
-            try:
-                if path.is_dir():
-                    for child in sorted(path.rglob("*"), reverse=True):
-                        if child.is_file() or child.is_symlink():
-                            child.unlink(missing_ok=True)
-                        elif child.is_dir():
-                            child.rmdir()
-                    path.rmdir()
-            except OSError:
-                pass
-
-        # 不保留 terminus 专用产物，避免污染 openclaw 适配器输出。
-        # 不保留 terminus 专用产物，避免污染 openclaw 适配器输出。
-        for name in ("recording.cast", "terminus_2.pane"):
-            artifact = self.logs_dir / name
-            if artifact.exists() and artifact.is_file():
-                try:
-                    artifact.unlink()
-                except OSError:
-                    pass
-
-        state_dir = self.logs_dir / "openclaw-state"
-        if state_dir.exists() and state_dir.is_dir():
-            try:
-                for child in sorted(state_dir.rglob("*"), reverse=True):
-                    if child.is_file() or child.is_symlink():
-                        child.unlink(missing_ok=True)
-                    elif child.is_dir():
-                        child.rmdir()
-                state_dir.rmdir()
-            except OSError:
-                pass
-
-    def _build_register_mcp_servers_command(self, mode: str) -> str | None:
-        # 模块：MCP 服务注册命令构建
-        # 输入：`mode` 与 `self.mcp_servers`
-        # 输出：shell 命令字符串（无 MCP 时返回 None）
-        # 作用：生成 OpenClaw/兼容后端可读取的 MCP 配置文件。
-        # 模块：MCP 服务注册命令构建
-        # 输入：`mode` 与 `self.mcp_servers`
-        # 输出：shell 命令字符串（无 MCP 时返回 None）
-        # 作用：生成 OpenClaw/兼容后端可读取的 MCP 配置文件。
-        if not self.mcp_servers:
-            return None
-
-        servers: dict[str, dict[str, Any]] = {}
-        for server in self.mcp_servers:
-            if server.transport == "stdio":
-                entry: dict[str, Any] = {
-                    "command": server.command,
-                    "args": server.args,
-                }
-            elif server.transport == "streamable-http":
-                entry = {"baseUrl": server.url}
+            if item.get("isReasoning") is True:
+                reasoning_parts.append(t.strip())
             else:
-                entry = {"url": server.url}
-            servers[server.name] = entry
+                text_parts.append(t.strip())
 
-        mcporter = json.dumps({"mcpServers": servers}, indent=2)
-        escaped_mcporter = shlex.quote(mcporter)
+        assistant_text = "\n\n".join(text_parts) if text_parts else ""
+        if not assistant_text and isinstance(
+            meta.get("finalAssistantVisibleText"), str
+        ):
+            assistant_text = meta["finalAssistantVisibleText"].strip()
 
-        if mode == "legacy":
-            return (
-                f"mkdir -p /root/.mcporter && "
-                f"echo {escaped_mcporter} > {_MCPORTER_CONFIG}"
+        tool_calls: list[ToolCall] | None = None
+        pending = meta.get("pendingToolCalls")
+        if isinstance(pending, list):
+            calls: list[ToolCall] = []
+            for c in pending:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("name")
+                if not isinstance(name, str):
+                    continue
+                args_raw = c.get("arguments", "")
+                if isinstance(args_raw, str):
+                    try:
+                        args: dict[str, Any] = (
+                            json.loads(args_raw) if args_raw.strip() else {}
+                        )
+                    except json.JSONDecodeError:
+                        args = {"raw": args_raw}
+                elif isinstance(args_raw, dict):
+                    args = args_raw
+                else:
+                    args = {}
+                cid = c.get("id")
+                calls.append(
+                    ToolCall(
+                        tool_call_id=str(cid) if cid is not None else "",
+                        function_name=name,
+                        arguments=args,
+                    )
+                )
+            if calls:
+                tool_calls = calls
+
+        usage: dict[str, Any] | None = None
+        if isinstance(agent_meta, dict):
+            u = agent_meta.get("usage")
+            if isinstance(u, dict):
+                usage = u
+
+        input_tok = int(usage.get("input") or 0) if usage else 0
+        output_tok = int(usage.get("output") or 0) if usage else 0
+        cache_read = int(usage.get("cacheRead") or 0) if usage else 0
+        cache_write = int(usage.get("cacheWrite") or 0) if usage else 0
+
+        prompt_for_metrics = input_tok + cache_read
+        step_metrics: Metrics | None = None
+        if input_tok or output_tok or cache_read:
+            step_metrics = Metrics(
+                prompt_tokens=prompt_for_metrics or None,
+                completion_tokens=output_tok or None,
+                cached_tokens=cache_read or None,
+                extra=({"cache_write_tokens": cache_write} if cache_write else None),
             )
 
-        # 在 cli-backend 模式仍写入 mcporter 配置保持兼容，
-        # 同时额外写一份后端可直接读取的 MCP 配置。
-        # 在 cli-backend 模式仍写入 mcporter 配置保持兼容，
-        # 同时额外写一份后端可直接读取的 MCP 配置。
-        backend_mcp_config = shlex.quote(json.dumps({"mcpServers": servers}, indent=2))
-        return (
-            f"mkdir -p /root/.mcporter {_STATE_DIR} && "
-            f"echo {escaped_mcporter} > {_MCPORTER_CONFIG} && "
-            f"echo {backend_mcp_config} > {_STATE_DIR}/backend-mcp.json"
-        )
-
-    def _build_register_skills_command(self) -> str | None:
-        # 模块：Skills 同步命令构建
-        # 输入：`self.skills_dir`
-        # 输出：复制 skills 的 shell 命令（无目录时返回 None）
-        # 作用：将 Harbor 提供的技能目录同步到容器内固定位置。
-        # 模块：Skills 同步命令构建
-        # 输入：`self.skills_dir`
-        # 输出：复制 skills 的 shell 命令（无目录时返回 None）
-        # 作用：将 Harbor 提供的技能目录同步到容器内固定位置。
-        if not self.skills_dir:
-            return None
-        return (
-            f"mkdir -p {_SKILLS_DIR} && "
-            f"cp -r {shlex.quote(self.skills_dir)}/* "
-            f"{_SKILLS_DIR}/ 2>/dev/null || true"
-        )
-
-    def _resolve_session_dirs(self) -> list[Path]:
-        # 模块：Session 目录发现
-        # 输入：`logs_dir/openclaw-state/agents`
-        # 输出：可用 sessions 目录列表
-        # 作用：为 transcript 定位提供候选路径集合。
-        # 模块：Session 目录发现
-        # 输入：`logs_dir/openclaw-state/agents`
-        # 输出：可用 sessions 目录列表
-        # 作用：为 transcript 定位提供候选路径集合。
-        agents_dir = self.logs_dir / "openclaw-state" / "agents"
-        if not agents_dir.exists() or not agents_dir.is_dir():
-            return []
-
-        dirs: list[Path] = []
-        for entry in agents_dir.iterdir():
-            if entry.is_dir():
-                sessions = entry / "sessions"
-                if sessions.exists() and sessions.is_dir():
-                    dirs.append(sessions)
-        return sorted(dirs)
-
-    def _find_transcript_path(self, session_id: str) -> Path | None:
-        """定位 transcript 文件路径。
-
-        输入：`session_id`（可为空，空时退化为“取最新 transcript”策略）。
-        输出：可读 transcript 文件路径或 `None`。
-        作用：
-        1) 优先使用已复制到 logs 目录的 transcript；
-        2) 其次在 sessions 目录按 session/topic/reset 命名匹配；
-        3) 在多个匹配文件中选择最新修改时间的文件。
-        """
-
-        """定位 transcript 文件路径。
-
-        输入：`session_id`（可为空，空时退化为“取最新 transcript”策略）。
-        输出：可读 transcript 文件路径或 `None`。
-        作用：
-        1) 优先使用已复制到 logs 目录的 transcript；
-        2) 其次在 sessions 目录按 session/topic/reset 命名匹配；
-        3) 在多个匹配文件中选择最新修改时间的文件。
-        """
-
-        copied = self.logs_dir / _COPIED_TRANSCRIPT_FILENAME
-        if copied.exists() and copied.is_file():
-            try:
-                if copied.stat().st_size > 0:
-                    return copied
-            except OSError:
-                pass
-
-        session_dirs = self._resolve_session_dirs()
-        if not session_dirs:
-            return None
-
-        def newest_matching(patterns: tuple[str, ...]) -> Path | None:
-            # 优先取最新文件；OpenClaw 可能在同目录并存 reset/topic 变体。
-            # 优先取最新文件；OpenClaw 可能在同目录并存 reset/topic 变体。
-            latest_path: Path | None = None
-            latest_mtime = -1.0
-            for sessions in session_dirs:
-                for pattern in patterns:
-                    for candidate in sessions.glob(pattern):
-                        if not candidate.is_file():
-                            continue
-                        try:
-                            stat = candidate.stat()
-                        except OSError:
-                            continue
-                        if stat.st_mtime > latest_mtime:
-                            latest_mtime = stat.st_mtime
-                            latest_path = candidate
-            return latest_path
-
-        if session_id:
-            # OpenClaw 可能将 transcript 按 topic 存为
-            # <sessionId>-topic-<encodedTopic>.jsonl，重置归档则是 *.jsonl.reset.*。
-            # 这里同时兼容两类命名。
-            # OpenClaw 可能将 transcript 按 topic 存为
-            # <sessionId>-topic-<encodedTopic>.jsonl，重置归档则是 *.jsonl.reset.*。
-            # 这里同时兼容两类命名。
-            matched = newest_matching(
-                (
-                    f"{session_id}.jsonl",
-                    f"{session_id}-topic-*.jsonl",
-                    f"{session_id}.jsonl.reset.*",
-                    f"{session_id}-topic-*.jsonl.reset.*",
-                )
-            )
-            if matched is not None:
-                return matched
-
-        return newest_matching(("*.jsonl", "*.jsonl.reset.*"))
-
-    def _extract_tool_result_text(self, content: Any) -> str | None:
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-                        continue
-                    parts.append(json.dumps(item, ensure_ascii=False))
-                    continue
-                if item is None:
-                    continue
-                item_text = str(item).strip()
-                if item_text:
-                    parts.append(item_text)
-            merged = "\n".join(part for part in parts if part).strip()
-            return merged or None
-
-        if isinstance(content, dict):
-            text = content.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-            rendered = json.dumps(content, ensure_ascii=False).strip()
-            return rendered or None
-
-        if isinstance(content, str):
-            normalized = content.strip()
-            return normalized or None
-
-        if content is None:
-            return None
-
-        normalized = str(content).strip()
-        return normalized or None
-
-    def _extract_tool_result_text(self, content: Any) -> str | None:
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-                        continue
-                    parts.append(json.dumps(item, ensure_ascii=False))
-                    continue
-                if item is None:
-                    continue
-                item_text = str(item).strip()
-                if item_text:
-                    parts.append(item_text)
-            merged = "\n".join(part for part in parts if part).strip()
-            return merged or None
-
-        if isinstance(content, dict):
-            text = content.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-            rendered = json.dumps(content, ensure_ascii=False).strip()
-            return rendered or None
-
-        if isinstance(content, str):
-            normalized = content.strip()
-            return normalized or None
-
-        if content is None:
-            return None
-
-        normalized = str(content).strip()
-        return normalized or None
-
-    def _parse_transcript_to_trajectory(
-        self, session_id: str, default_model_name: str
-    ) -> Trajectory | None:
-        """将 OpenClaw transcript 转换为 Harbor ATIF 轨迹。
-
-        输入：`session_id` 与默认模型名。
-        输出：`Trajectory` 或 `None`。
-        作用：
-        1) 解析 user/assistant/system 事件；
-        2) 提取 tool_use/tool_result 并做关联合并；
-        3) 汇总 token metrics，生成标准 ATIF 结构。
-        """
-
-        """将 OpenClaw transcript 转换为 Harbor ATIF 轨迹。
-
-        输入：`session_id` 与默认模型名。
-        输出：`Trajectory` 或 `None`。
-        作用：
-        1) 解析 user/assistant/system 事件；
-        2) 提取 tool_use/tool_result 并做关联合并；
-        3) 汇总 token metrics，生成标准 ATIF 结构。
-        """
-
-        transcript_path = self._find_transcript_path(session_id)
-        if transcript_path is None:
-            self._append_job_log("openclaw: transcript not found; skip ATIF trajectory parse")
-            return None
-
-        raw_lines: list[dict[str, Any]] = []
-        try:
-            transcript_lines = transcript_path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            self._append_job_log(f"openclaw: failed to read transcript: {exc}")
-            return None
-
-        for line in transcript_lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                obj = json.loads(stripped)
-                if isinstance(obj, dict):
-                    raw_lines.append(obj)
-            except json.JSONDecodeError:
-                continue
-
-        if not raw_lines:
-            return None
-
-        proto_turns: list[dict[str, Any]] = []
-        total_input = total_output = total_cache_read = 0
-
-        for event in raw_lines:
-            message = event.get("message")
-            if not isinstance(message, dict):
-                continue
-
-            role_raw = message.get("role")
-            role = str(role_raw).strip().lower() if role_raw is not None else ""
-            if role not in ("user", "assistant", "system", "toolresult"):
-            role_raw = message.get("role")
-            role = str(role_raw).strip().lower() if role_raw is not None else ""
-            if role not in ("user", "assistant", "system", "toolresult"):
-                continue
-
-            timestamp = event.get("timestamp")
-            model_from_event = event.get("model") or message.get("model") or default_model_name
-            content = message.get("content", "")
-
-            if isinstance(content, str):
-                blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
-            elif isinstance(content, list):
-                blocks = [b for b in content if isinstance(b, dict)]
-            else:
-                blocks = []
-
-            metrics: Metrics | None = None
-            if role == "assistant":
-                usage = message.get("usage") or event.get("usage") or {}
-                usage_map = self._extract_usage_map(usage if isinstance(usage, dict) else {})
-                inp = usage_map.get("input", 0)
-                out = usage_map.get("output", 0)
-                cache_read = usage_map.get("cacheRead", 0)
-                total_input += inp
-                total_output += out
-                total_cache_read += cache_read
-                if inp or out or cache_read:
-                    metrics = Metrics(
-                        prompt_tokens=inp,
-                        completion_tokens=out,
-                        cached_tokens=cache_read,
-                    )
-
-            text_parts: list[str] = []
-            turn_tool_calls: list[ToolCall] = []
-            turn_tool_results: list[ObservationResult] = []
-
-            if role == "toolresult":
-                call_id_raw = (
-                    message.get("toolCallId")
-                    or message.get("toolUseId")
-                    or message.get("tool_call_id")
-                    or message.get("tool_use_id")
-                    or event.get("toolCallId")
-                    or event.get("toolUseId")
-                    or event.get("tool_call_id")
-                    or event.get("tool_use_id")
-                )
-                call_id = str(call_id_raw or "").strip()
-
-                tool_name = str(message.get("toolName") or message.get("tool_name") or "").strip()
-                result_text = self._extract_tool_result_text(content)
-                if tool_name and result_text:
-                    result_text = f"[tool={tool_name}]\n{result_text}"
-
-                if call_id or result_text:
-                    turn_tool_results.append(
-                        ObservationResult(
-                            source_call_id=call_id or None,
-                            content=result_text,
-                        )
-                    )
-
-                proto_turns.append(
-                    {
-                        "role": role,
-                        "timestamp": timestamp,
-                        "model": model_from_event,
-                        "text_parts": text_parts,
-                        "tool_calls": turn_tool_calls,
-                        "tool_results": turn_tool_results,
-                        "merged_results": [],
-                        "metrics": metrics,
-                    }
-                )
-                continue
-
-            if role == "toolresult":
-                call_id_raw = (
-                    message.get("toolCallId")
-                    or message.get("toolUseId")
-                    or message.get("tool_call_id")
-                    or message.get("tool_use_id")
-                    or event.get("toolCallId")
-                    or event.get("toolUseId")
-                    or event.get("tool_call_id")
-                    or event.get("tool_use_id")
-                )
-                call_id = str(call_id_raw or "").strip()
-
-                tool_name = str(message.get("toolName") or message.get("tool_name") or "").strip()
-                result_text = self._extract_tool_result_text(content)
-                if tool_name and result_text:
-                    result_text = f"[tool={tool_name}]\n{result_text}"
-
-                if call_id or result_text:
-                    turn_tool_results.append(
-                        ObservationResult(
-                            source_call_id=call_id or None,
-                            content=result_text,
-                        )
-                    )
-
-                proto_turns.append(
-                    {
-                        "role": role,
-                        "timestamp": timestamp,
-                        "model": model_from_event,
-                        "text_parts": text_parts,
-                        "tool_calls": turn_tool_calls,
-                        "tool_results": turn_tool_results,
-                        "merged_results": [],
-                        "metrics": metrics,
-                    }
-                )
-                continue
-
-            for block in blocks:
-                btype = str(block.get("type") or "").lower()
-
-                if btype == "text":
-                    text = str(block.get("text") or "").strip()
-                    if text:
-                        text_parts.append(text)
-                elif btype in ("tool_use", "toolcall", "tool_call"):
-                    call_id = str(block.get("id") or "")
-                    tool_name = str(block.get("name") or "")
-                    arguments = block.get("input")
-                    if arguments is None:
-                        arguments = block.get("arguments")
-                    if arguments is None:
-                        arguments = {}
-                    arguments = block.get("input")
-                    if arguments is None:
-                        arguments = block.get("arguments")
-                    if arguments is None:
-                        arguments = {}
-                    if not isinstance(arguments, dict):
-                        arguments = {"input": arguments}
-                    turn_tool_calls.append(
-                        ToolCall(
-                            tool_call_id=call_id,
-                            function_name=tool_name,
-                            arguments=arguments,
-                        )
-                    )
-                elif btype in ("tool_result", "tool_result_error"):
-                    call_id = str(
-                        block.get("tool_use_id")
-                        or block.get("toolUseId")
-                        or block.get("tool_call_id")
-                        or block.get("toolCallId")
-                        or ""
-                    )
-                    result_text = self._extract_tool_result_text(block.get("content"))
-                    call_id = str(
-                        block.get("tool_use_id")
-                        or block.get("toolUseId")
-                        or block.get("tool_call_id")
-                        or block.get("toolCallId")
-                        or ""
-                    )
-                    result_text = self._extract_tool_result_text(block.get("content"))
-                    turn_tool_results.append(
-                        ObservationResult(
-                            source_call_id=call_id or None,
-                            content=result_text,
-                        )
-                    )
-
-            proto_turns.append(
-                {
-                    "role": role,
-                    "timestamp": timestamp,
-                    "model": model_from_event,
-                    "text_parts": text_parts,
-                    "tool_calls": turn_tool_calls,
-                    "tool_results": turn_tool_results,
-                    "merged_results": [],
-                    "metrics": metrics,
-                }
-            )
-
-        for i, turn in enumerate(proto_turns):
-            if not turn["tool_results"]:
-                continue
-            for j in range(i - 1, -1, -1):
-                prev = proto_turns[j]
-                if prev["role"] == "assistant" and prev["tool_calls"]:
-                    prev["merged_results"].extend(turn["tool_results"])
-                    turn["tool_results"] = []
-                    break
-
-        steps: list[Step] = []
-        step_id = 1
-
-        for turn in proto_turns:
-            text = "\n\n".join(turn["text_parts"])
-            tool_calls = turn["tool_calls"] or None
-            all_results = turn["merged_results"] + turn["tool_results"]
-            observation = Observation(results=all_results) if all_results else None
-
-            if not text and tool_calls is None and observation is None and turn["metrics"] is None:
-                continue
-
-            source = "agent" if turn["role"] not in ("user", "system") else turn["role"]
-            source = "agent" if turn["role"] not in ("user", "system") else turn["role"]
-            steps.append(
-                Step(
-                    step_id=step_id,
-                    timestamp=turn["timestamp"],
-                    source=source,  # type: ignore[arg-type]
-                    model_name=turn["model"] if source == "agent" else None,
-                    message=text or "",
-                    tool_calls=tool_calls,
-                    observation=observation,
-                    metrics=turn["metrics"],
-                )
-            )
-            step_id += 1
-
-        if not steps:
-            return None
+        steps: list[Step] = [
+            Step(
+                step_id=1,
+                source="user",
+                message=instruction,
+            ),
+        ]
+        agent_step_kwargs: dict[str, Any] = {
+            "step_id": 2,
+            "source": "agent",
+            "message": assistant_text or "(no assistant text in JSON output)",
+            "model_name": self.model_name,
+        }
+        if reasoning_parts:
+            agent_step_kwargs["reasoning_content"] = "\n\n".join(reasoning_parts)
+        if tool_calls:
+            agent_step_kwargs["tool_calls"] = tool_calls
+        if step_metrics:
+            agent_step_kwargs["metrics"] = step_metrics
+        steps.append(Step(**agent_step_kwargs))
 
         final_metrics = FinalMetrics(
-            total_prompt_tokens=total_input or None,
-            total_completion_tokens=total_output or None,
-            total_cached_tokens=total_cache_read or None,
-            total_cost_usd=None,
+            total_prompt_tokens=prompt_for_metrics or None,
+            total_completion_tokens=output_tok or None,
+            total_cached_tokens=cache_read or None,
             total_steps=len(steps),
         )
 
         return Trajectory(
-            schema_version="ATIF-v1.2",
+            schema_version="ATIF-v1.7",
             session_id=session_id,
             agent=Agent(
-                name=AgentName.OPENCLAW.value,
+                name="openclaw",
                 version=self.version() or "unknown",
-                model_name=default_model_name,
+                model_name=self.model_name,
             ),
             steps=steps,
             final_metrics=final_metrics,
+        )
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        envelope = self._parse_stdout()
+        if not envelope:
+            return
+
+        instruction_path = self.logs_dir / "instruction.txt"
+        instruction = ""
+        try:
+            if instruction_path.exists():
+                instruction = instruction_path.read_text()
+        except OSError:
+            pass
+
+        try:
+            trajectory = None
+            if self._use_openclaw_session_jsonl_for_steps:
+                session_path = self.logs_dir / "openclaw.session.jsonl"
+                session_steps = openclaw_session_jsonl_to_atif_steps(
+                    session_path,
+                    instruction=instruction,
+                    model_name=self.model_name or "",
+                )
+                if session_steps:
+                    trajectory = self._trajectory_from_envelope_with_steps(
+                        envelope, session_steps
+                    )
+            if trajectory is None:
+                trajectory = self._convert_envelope_to_trajectory(envelope, instruction)
+        except Exception:
+            self.logger.exception("Failed to convert OpenClaw JSON to trajectory")
+            return
+
+        if not trajectory:
+            return
+
+        trajectory_path = self.logs_dir / "trajectory.json"
+        try:
+            trajectory_path.write_text(
+                format_trajectory_json(trajectory.to_json_dict())
+            )
+            self.logger.debug(f"Wrote OpenClaw trajectory to {trajectory_path}")
+        except OSError as exc:
+            self.logger.debug(
+                f"Failed to write trajectory file {trajectory_path}: {exc}"
+            )
+
+        if trajectory.final_metrics:
+            fm = trajectory.final_metrics
+            context.cost_usd = fm.total_cost_usd
+            context.n_input_tokens = fm.total_prompt_tokens or 0
+            context.n_output_tokens = fm.total_completion_tokens or 0
+            context.n_cache_tokens = fm.total_cached_tokens or 0
+
+    def _build_register_skills_command(self) -> str | None:
+        if not self.skills_dir:
+            return None
+        return (
+            f"mkdir -p ~/.openclaw/skills && "
+            f"cp -r {shlex.quote(self.skills_dir)}/* "
+            f"~/.openclaw/skills/ 2>/dev/null || true"
+        )
+
+    @with_prompt_template
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        escaped_instruction = shlex.quote(instruction)
+
+        if not self.model_name or "/" not in self.model_name:
+            raise ValueError("Model name must be in the format provider/model_name")
+
+        provider, _ = self.model_name.split("/", 1)
+        self._validate_provider(provider)
+
+        env: dict[str, str] = {}
+        keys = self._provider_env_keys(provider)
+        self.logger.debug(
+            "OpenClaw forwarding env vars for provider %r: %s",
+            provider,
+            list(keys),
+        )
+
+        for key in keys:
+            val = self._get_env(key)
+            if val:
+                env[key] = val
+            else:
+                self.logger.debug("Missing optional env key for OpenClaw run: %s", key)
+
+        upload_path = self.logs_dir / self._UPLOAD_CONFIG_FILENAME
+        upload_path.write_text(
+            json.dumps(
+                self._build_full_openclaw_config(),
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        try:
+            instruction_path = self.logs_dir / "instruction.txt"
+            instruction_path.write_text(instruction)
+        except OSError:
+            pass
+
+        await self.exec_as_agent(
+            environment,
+            command=_nvm22("openclaw setup --workspace ."),
+            env=env,
+        )
+
+        copy_upload = (
+            "mkdir -p ~/.openclaw && cp "
+            f"{shlex.quote(f'{self._CONTAINER_LOGS_AGENT}/{self._UPLOAD_CONFIG_FILENAME}')} "
+            "~/.openclaw/openclaw.json"
+        )
+        await self.exec_as_agent(
+            environment,
+            command=copy_upload,
+            env=env,
+        )
+
+        skills_command = self._build_register_skills_command()
+        if skills_command:
+            await self.exec_as_agent(environment, command=skills_command, env=env)
+
+        # v2026.5.5：设置 state dir，用于运行后 session 文件发现的备用路径。
+        _state_dir = "/tmp/openclaw-state"
+        env["OPENCLAW_STATE_DIR"] = _state_dir
+
+        cli_flags = self.build_cli_flags()
+        cli_flags_arg = (cli_flags + " ") if cli_flags else ""
+        command = (
+            f"mkdir -p {_state_dir} && "
+            ". ~/.nvm/nvm.sh && nvm use 22 && "
+            f"openclaw agent --local --json {cli_flags_arg}"
+            f"--model {shlex.quote(self.model_name)} "
+            f"--message {escaped_instruction} "
+            f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/openclaw.txt"
+        )
+        self.logger.debug("OpenClaw agent env keys: %s", sorted(env))
+        self.logger.debug("OpenClaw agent command: %s", command)
+        await self.exec_as_agent(environment, command, env=env)
+        # 先尝试旧方式（agentMeta.sessionFile），再用 state dir glob 作为 v2026.5.5 备用。
+        await self._copy_openclaw_session_file_to_agent_logs(environment, env)
+        _session_dest = "/logs/agent/openclaw.session.jsonl"
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"if [ ! -s {_session_dest} ]; then "
+                f"  _latest=$(ls -1t {_state_dir}/agents/*/sessions/*.jsonl"
+                f" {_state_dir}/agents/*/sessions/*.jsonl.reset.*"
+                f" 2>/dev/null | head -n1 || true); "
+                f"  [ -n \"$_latest\" ] && cp \"$_latest\" {_session_dest} || true; "
+                "fi"
+            ),
+            env=env,
         )

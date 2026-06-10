@@ -3,11 +3,16 @@ import os
 import shlex
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    CliFlag,
+    with_prompt_template,
+)
 from harbor.agents.utils import get_api_key_var_names_from_model_name
+from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
 from harbor.models.trajectories import (
@@ -41,12 +46,76 @@ def _normalize_content(raw_content: Any) -> str:
     return str(raw_content)
 
 
+def _iso_timestamp(value: Any) -> str | None:
+    """Normalize upstream timestamps to ISO 8601, when available."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _message_timestamp(message: dict[str, Any]) -> str | None:
+    """Return the best upstream timestamp attached to a mini-swe-agent message."""
+    for field in ("created_at", "timestamp", "completed_at"):
+        timestamp = _iso_timestamp(message.get(field))
+        if timestamp:
+            return timestamp
+
+    extra = message.get("extra") or {}
+    if isinstance(extra, dict):
+        return _iso_timestamp(extra.get("timestamp"))
+    return None
+
+
+def _message_usage(message: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized usage dict for a mini-swe-agent message.
+
+    Handles both shapes mini-swe-agent emits depending on model class:
+    - ``LitellmModel`` (chat-completions): usage under
+      ``extra.response.usage`` with ``prompt_tokens`` / ``completion_tokens``.
+    - ``LitellmResponseModel`` (Responses API): the message *is* the response
+      object — usage at top level with ``input_tokens`` / ``output_tokens``.
+
+    Always returns chat-completions field names so callers stay simple.
+    """
+    usage = ((message.get("extra") or {}).get("response") or {}).get("usage") or {}
+    if not usage and message.get("object") == "response":
+        usage = message.get("usage") or {}
+    return {
+        "prompt_tokens": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+        "completion_tokens": usage.get("completion_tokens")
+        or usage.get("output_tokens")
+        or 0,
+        "prompt_tokens_details": usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {},
+        "completion_tokens_details": usage.get("completion_tokens_details")
+        or usage.get("output_tokens_details")
+        or {},
+    }
+
+
 def _add_observation_to_last_agent_step(
-    steps: list[Step], content: str, _logger: Any, message_index: int
+    steps: list[Step],
+    content: str,
+    _logger: Any,
+    message_index: int,
+    timestamp: str | None = None,
 ) -> None:
     """Add observation content to the most recent agent step."""
     if steps and steps[-1].source == "agent":
         prev_step = steps[-1]
+        if timestamp and prev_step.timestamp is None:
+            prev_step.timestamp = timestamp
         if prev_step.observation and prev_step.observation.results:
             prev_step.observation.results.append(ObservationResult(content=content))
         else:
@@ -54,7 +123,7 @@ def _add_observation_to_last_agent_step(
                 results=[ObservationResult(content=content)]
             )
     else:
-        _logger.warning(f"Message at index {message_index} has no preceding agent step")
+        _logger.debug(f"Message at index {message_index} has no preceding agent step")
 
 
 def _build_step_metrics(
@@ -168,25 +237,20 @@ def convert_mini_swe_agent_to_atif(
 
     # First pass: count total completion tokens for cost apportioning
     for message in messages:
-        extra = message.get("extra") or {}
-        response_data = extra.get("response") or {}
-        usage = response_data.get("usage") or {}
-        total_completion_tokens += usage.get("completion_tokens") or 0
+        total_completion_tokens += _message_usage(message)["completion_tokens"]
 
     # Process messages
     for i, message in enumerate(messages):
         role = message.get("role")
         content = _normalize_content(message.get("content"))
-        extra = message.get("extra") or {}
+        timestamp = _message_timestamp(message)
 
         # Extract token usage
-        response_data = extra.get("response") or {}
-        usage = response_data.get("usage") or {}
-
-        prompt_tokens = usage.get("prompt_tokens") or 0
-        completion_tokens = usage.get("completion_tokens") or 0
-        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-        completion_tokens_details = usage.get("completion_tokens_details") or {}
+        usage = _message_usage(message)
+        prompt_tokens = usage["prompt_tokens"]
+        completion_tokens = usage["completion_tokens"]
+        prompt_tokens_details = usage["prompt_tokens_details"]
+        completion_tokens_details = usage["completion_tokens_details"]
         cached_tokens = prompt_tokens_details.get("cached_tokens") or 0
         reasoning_tokens = completion_tokens_details.get("reasoning_tokens") or 0
 
@@ -198,7 +262,7 @@ def convert_mini_swe_agent_to_atif(
             steps.append(
                 Step(
                     step_id=step_id,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    timestamp=timestamp,
                     source="system",
                     message=content,
                 )
@@ -210,17 +274,19 @@ def convert_mini_swe_agent_to_atif(
                 steps.append(
                     Step(
                         step_id=step_id,
-                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        timestamp=timestamp,
                         source="user",
                         message=content,
                     )
                 )
                 step_id += 1
             else:
-                _add_observation_to_last_agent_step(steps, content, _logger, i)
+                _add_observation_to_last_agent_step(
+                    steps, content, _logger, i, timestamp
+                )
 
         elif role == "tool":
-            _add_observation_to_last_agent_step(steps, content, _logger, i)
+            _add_observation_to_last_agent_step(steps, content, _logger, i, timestamp)
 
         elif role == "assistant":
             tool_calls, reasoning = _parse_tool_calls(message, content, step_id)
@@ -238,7 +304,7 @@ def convert_mini_swe_agent_to_atif(
             steps.append(
                 Step(
                     step_id=step_id,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    timestamp=timestamp,
                     source="agent",
                     model_name=model_name,
                     message=content,
@@ -273,7 +339,7 @@ def convert_mini_swe_agent_to_atif(
     )
 
     return Trajectory(
-        schema_version="ATIF-v1.2",
+        schema_version="ATIF-v1.7",
         session_id=session_id,
         agent=agent,
         steps=steps,
@@ -311,7 +377,7 @@ def convert_and_save_trajectory(
             json.dumps(atif_trajectory.to_json_dict(), indent=2)
         )
 
-        _logger.info(
+        _logger.debug(
             f"Successfully converted trajectory to ATIF format: {atif_trajectory_path}"
         )
 
@@ -327,21 +393,85 @@ class MiniSweAgent(BaseInstalledAgent):
 
     SUPPORTS_ATIF: bool = True
 
+    CLI_FLAGS = [
+        CliFlag(
+            "cost_limit",
+            cli="--cost-limit",
+            type="str",
+            default="0",
+        ),
+    ]
+
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        config_file: str | None = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._reasoning_effort = reasoning_effort
+        self._config_yaml: str | None = None
+        if config_file:
+            self._config_yaml = Path(config_file).read_text()
+
     @staticmethod
     def name() -> str:
         return AgentName.MINI_SWE_AGENT.value
 
-    @property
-    def _install_agent_template_path(self) -> Path:
-        return Path(__file__).parent / "install-mini-swe-agent.sh.j2"
+    def get_version_command(self) -> str | None:
+        return (
+            '. "$HOME/.local/bin/env"; uv tool list 2>/dev/null | grep mini-swe-agent'
+        )
+
+    def parse_version(self, stdout: str) -> str:
+        # Output: "mini-swe-agent v0.1.2"
+        import re
+
+        match = re.search(r"(\d+\.\d+\S*)", stdout)
+        return match.group(1) if match else stdout.strip()
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        # Install build tools (multi-OS)
+        await self.exec_as_root(
+            environment,
+            command=(
+                "if command -v apt-get &>/dev/null; then"
+                "  apt-get update && apt-get install -y curl build-essential git;"
+                " elif command -v apk &>/dev/null; then"
+                "  apk add --no-cache curl bash build-base git python3 py3-pip;"
+                " elif command -v yum &>/dev/null; then"
+                "  yum install -y curl git gcc make;"
+                " elif command -v dnf &>/dev/null; then"
+                "  dnf install -y curl git gcc make;"
+                " else"
+                '  echo "Warning: No known package manager found, assuming build tools are available" >&2;'
+                " fi"
+            ),
+            env={"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        version_spec = f"=={self._version}" if self._version else ""
+        await self.exec_as_agent(
+            environment,
+            command=(
+                "set -euo pipefail; "
+                "curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh && "
+                'if ! grep -q \'export PATH="$HOME/.local/bin:$PATH"\' "$HOME/.bashrc" 2>/dev/null; then'
+                '  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc";'
+                " fi && "
+                'source "$HOME/.local/bin/env" && '
+                f"uv tool install mini-swe-agent{version_spec} && "
+                "mini-swe-agent --help"
+            ),
+        )
 
     @property
-    def _mini_swe_agent_trajectory_path(self) -> Path:
+    def _mini_swe_agent_trajectory_path(self) -> PurePosixPath:
         """Path where mini-swe-agent writes its own trajectory format."""
         return EnvironmentPaths.agent_dir / "mini-swe-agent.trajectory.json"
 
     @property
-    def _atif_trajectory_path(self) -> Path:
+    def _atif_trajectory_path(self) -> PurePosixPath:
         """Path where we write the ATIF-formatted trajectory."""
         return EnvironmentPaths.agent_dir / "trajectory.json"
 
@@ -350,7 +480,7 @@ class MiniSweAgent(BaseInstalledAgent):
         mini_trajectory_path = self.logs_dir / "mini-swe-agent.trajectory.json"
 
         if not mini_trajectory_path.exists():
-            print(
+            self.logger.debug(
                 f"Mini-swe-agent trajectory file {mini_trajectory_path} does not exist"
             )
             return
@@ -358,7 +488,7 @@ class MiniSweAgent(BaseInstalledAgent):
         try:
             mini_trajectory = json.loads(mini_trajectory_path.read_text())
         except Exception as e:
-            print(f"Failed to load mini-swe-agent trajectory: {e}")
+            self.logger.debug(f"Failed to load mini-swe-agent trajectory: {e}")
             return
 
         # Extract token usage from mini-swe-agent format
@@ -369,15 +499,10 @@ class MiniSweAgent(BaseInstalledAgent):
             "instance_cost"
         ) or 0
         for message in mini_trajectory.get("messages") or []:
-            usage = ((message.get("extra") or {}).get("response") or {}).get(
-                "usage"
-            ) or {}
-
-            prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-            n_cache_tokens += prompt_tokens_details.get("cached_tokens") or 0
-
-            n_input_tokens += usage.get("prompt_tokens") or 0
-            n_output_tokens += usage.get("completion_tokens") or 0
+            usage = _message_usage(message)
+            n_cache_tokens += usage["prompt_tokens_details"].get("cached_tokens") or 0
+            n_input_tokens += usage["prompt_tokens"]
+            n_output_tokens += usage["completion_tokens"]
 
         context.n_input_tokens = n_input_tokens
         context.n_output_tokens = n_output_tokens
@@ -394,16 +519,31 @@ class MiniSweAgent(BaseInstalledAgent):
                 session_id=session_id,
             )
         except Exception as e:
-            print(f"Failed to convert trajectory to ATIF format: {e}")
+            self.logger.debug(f"Failed to convert trajectory to ATIF format: {e}")
 
-    def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
-        escaped_instruction = shlex.quote(instruction)
+    @with_prompt_template
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        augmented_instruction = instruction
+        if self.mcp_servers:
+            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+            for s in self.mcp_servers:
+                if s.transport == "stdio":
+                    args_str = " ".join(s.args)
+                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+                else:
+                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+            augmented_instruction = instruction + mcp_info
+
+        escaped_instruction = shlex.quote(augmented_instruction)
 
         if not self.model_name or "/" not in self.model_name:
             raise ValueError("Model name must be in the format provider/model_name")
 
         env = {
             "MSWEA_CONFIGURED": "true",  # Disable interactive setup
+            "MSWEA_COST_TRACKING": "ignore_errors",  # Ignore unknown model costs
         }
 
         if "MSWEA_API_KEY" in os.environ:
@@ -429,14 +569,55 @@ class MiniSweAgent(BaseInstalledAgent):
         if "OPENAI_API_BASE" in os.environ:
             env["OPENAI_API_BASE"] = os.environ["OPENAI_API_BASE"]
 
-        return [
-            ExecInput(
-                command=(
-                    '. "$HOME/.local/bin/env"; '
-                    f"mini-swe-agent --yolo --model={self.model_name} --task={escaped_instruction} "
-                    f"--output={self._mini_swe_agent_trajectory_path} --cost-limit=0 "
-                    f"--exit-immediately 2>&1 </dev/null | stdbuf -oL tee /logs/agent/mini-swe-agent.txt"
-                ),
-                env=env,
+        cli_flags = self.build_cli_flags()
+        extra_flags = (cli_flags + " ") if cli_flags else ""
+
+        # Write custom config into the container if provided
+        config_flags = ""
+        if self._config_yaml:
+            config_path = "/tmp/mswea-config/custom.yaml"
+            heredoc_marker = f"MSWEA_CONFIG_EOF_{uuid.uuid4().hex[:8]}"
+            write_config_cmd = (
+                f"mkdir -p /tmp/mswea-config\n"
+                f"cat > '{config_path}' << '{heredoc_marker}'\n"
+                f"{self._config_yaml}\n"
+                f"{heredoc_marker}\n"
             )
-        ]
+            await self.exec_as_agent(environment, command=write_config_cmd, env=env)
+            config_flags = f"-c {config_path} "
+
+        if self._reasoning_effort:
+            eff = shlex.quote(self._reasoning_effort)
+            if self.model_name.startswith("openai/"):
+                # OpenAI gpt-5.x rejects tools+reasoning_effort on
+                # /v1/chat/completions ("use /v1/responses instead").
+                # mini-swe-agent's LitellmResponseModel routes via
+                # litellm.responses(); effort is reasoning.effort there.
+                config_flags += (
+                    "-c model.model_class=litellm_response "
+                    f"-c model.model_kwargs.reasoning.effort={eff} "
+                )
+            else:
+                config_flags += (
+                    f"-c model.model_kwargs.extra_body.reasoning_effort={eff} "
+                )
+
+        # mini-swe-agent v2's -c is a *spec list*, not a merge-over-defaults:
+        # any -c suppresses the packaged config/mini.yaml (system_template etc).
+        # Prepend the builtin so dotted/file overrides layer on top of it.
+        # Bare "mini" resolves via mini-swe's own get_config_path() to
+        # builtin_config_dir/mini.yaml regardless of install location.
+        if config_flags:
+            config_flags = "-c mini " + config_flags
+
+        await self.exec_as_agent(
+            environment,
+            command=(
+                '. "$HOME/.local/bin/env"; '
+                f"mini-swe-agent --yolo --model={self.model_name} --task={escaped_instruction} "
+                f"--output={self._mini_swe_agent_trajectory_path} {extra_flags}"
+                f"{config_flags}"
+                f"--exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt"
+            ),
+            env=env,
+        )
