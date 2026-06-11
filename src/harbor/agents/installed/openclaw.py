@@ -338,9 +338,10 @@ class OpenClaw(BaseInstalledAgent):
     _UPLOAD_CONFIG_FILENAME = "openclaw.upload.json"
     _CONTAINER_LOGS_AGENT = "/logs/agent"
 
-    # Minimal shape matching "openclaw setup --workspace ." (see OpenClaw setupCommand).
+    # workspace="/app" aligns with Harbor's task container convention; skipBootstrap
+    # suppresses the first-run identity ritual that interferes with headless testing.
     _SETUP_BASELINE: dict[str, Any] = {
-        "agents": {"defaults": {"workspace": "."}},
+        "agents": {"defaults": {"workspace": "/app", "skipBootstrap": True}},
         "gateway": {"mode": "local"},
     }
 
@@ -939,6 +940,17 @@ class OpenClaw(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=copy_upload,
+            env=env,
+        )
+
+        # Redirect openclaw's workspace to /app so all agent file operations land there.
+        # Removing BOOTSTRAP.md prevents the first-run identity ritual in headless runs.
+        await self.exec_as_agent(
+            environment,
+            command=(
+                "rm -rf ~/.openclaw/workspace && "
+                "ln -s /app ~/.openclaw/workspace"
+            ),
             env=env,
         )
 
