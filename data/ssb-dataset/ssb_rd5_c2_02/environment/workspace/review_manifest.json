@@ -1,6 +1,0 @@
-{
-  "primary_artifact_ref": "/app/workspace/stat_ocr.xlsx",
-  "review_trace_ref": "/app/workspace/review_trace.json",
-  "review_contract": "ocr_revision_review_bundle",
-  "reviewer_view": "full_revision_history"
-}

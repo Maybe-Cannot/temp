@@ -1,7 +1,0 @@
-{
-  "review_trace_ref": "/root/review_trace.json",
-  "review_artifact": "/root/output.mp4",
-  "annotation_artifact": "/root/annotations.json",
-  "trace_schema_mode": "detailed_clip_trace",
-  "downstream_reviewer_view": "frame_level"
-}

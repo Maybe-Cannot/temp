@@ -1,4 +1,0 @@
-policy_mode=permissive-non-blocking
-block_on_unverified=false
-manual_review_required=true
-enforcement_action=allow_with_manual_followup

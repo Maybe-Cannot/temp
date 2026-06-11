@@ -1,6 +1,0 @@
-{
-  "review_trace_ref": "/home/github/build/failed/review_trace.json",
-  "review_artifact": "/home/github/build/failed/failed_reasons.txt",
-  "trace_schema_mode": "debug_trace_bundle",
-  "downstream_reviewer_view": "raw_debug"
-}
